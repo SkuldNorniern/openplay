@@ -11,6 +11,7 @@ keywords = ["airplay", "raop", "audio", "homepod", "streaming"]
 categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
 
 [lints.clippy]
 unwrap_used = "deny"

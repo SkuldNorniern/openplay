@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discovery;
 pub mod error;
 
 pub use error::{Error, Result};
