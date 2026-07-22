@@ -12,5 +12,6 @@
 pub mod cli;
 pub mod discovery;
 pub mod error;
+pub mod rtsp;
 
 pub use error::{Error, Result};
