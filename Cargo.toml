@@ -15,5 +15,10 @@ plist = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
 
 [lints.clippy]
-unwrap_used = "deny"
-expect_used = "deny"
+absolute_paths = "deny"
+result_large_err = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
