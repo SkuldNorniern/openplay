@@ -13,5 +13,6 @@ pub mod error;
 pub mod info;
 pub mod pairing;
 pub mod rtsp;
+pub mod session;
 
 pub use error::{Error, Result};
