@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod error;
 pub mod info;
 pub mod pairing;
+pub mod rtp;
 pub mod rtsp;
 pub mod session;
 
