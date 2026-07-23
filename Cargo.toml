@@ -11,6 +11,7 @@ keywords = ["airplay", "raop", "audio", "homepod", "streaming"]
 categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
+chacha20poly1305 = "0.11.0"
 hkdf = "0.13.0"
 plist = "1"
 rand = "0.10.2"

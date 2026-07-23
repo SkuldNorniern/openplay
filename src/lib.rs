@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod crypto;
 pub mod discovery;
 pub mod error;
 pub mod info;
