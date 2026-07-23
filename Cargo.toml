@@ -11,7 +11,11 @@ keywords = ["airplay", "raop", "audio", "homepod", "streaming"]
 categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
+hkdf = "0.13.0"
 plist = "1"
+rand = "0.10.2"
+sha2 = "0.11.0"
+srp = "0.7.0-rc.1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
 
 [lints.clippy]
