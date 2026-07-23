@@ -1,7 +1,4 @@
-//! Hand-rolled argument parsing for the dev binary.
-//!
-//! Intentionally tiny — no `clap`. The crate is library-first; this exists only
-//! to drive the protocol core while building it out.
+//! Hand-rolled command-line argument parsing. Intentionally tiny — no `clap`.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
