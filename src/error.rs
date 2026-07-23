@@ -2,11 +2,13 @@
 //!
 //! Hand-rolled to keep the dependency surface small — no `thiserror`/`anyhow`.
 
+use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::result::Result as StdResult;
 
 /// Convenience alias used throughout the crate.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = StdResult<T, Error>;
 
 /// Every fallible operation in openplay reports through this enum.
 #[derive(Debug)]
@@ -39,8 +41,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Error::Io(e) => Some(e),
             _ => None,
