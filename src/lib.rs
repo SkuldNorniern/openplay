@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod cli;
 pub mod crypto;
 pub mod discovery;
