@@ -8,7 +8,7 @@
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
 
-use plist::Value;
+use plist::{Dictionary, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 
@@ -59,7 +59,7 @@ impl DeviceInfo {
     }
 }
 
-fn public_key(dict: &plist::Dictionary) -> Result<Vec<u8>> {
+fn public_key(dict: &Dictionary) -> Result<Vec<u8>> {
     let data = dict
         .get("pk")
         .and_then(Value::as_data)
@@ -82,14 +82,14 @@ fn plist_uint(value: &Value) -> Option<u64> {
         .map(|s| s as u64)
 }
 
-fn string_field(dict: &plist::Dictionary, key: &str) -> Result<String> {
+fn string_field(dict: &Dictionary, key: &str) -> Result<String> {
     dict.get(key)
         .and_then(Value::as_string)
         .map(str::to_string)
         .ok_or_else(|| Error::Protocol(format!("info: missing {key}")))
 }
 
-fn u64_field(dict: &plist::Dictionary, key: &str) -> Result<u64> {
+fn u64_field(dict: &Dictionary, key: &str) -> Result<u64> {
     dict.get(key)
         .and_then(plist_uint)
         .ok_or_else(|| Error::Protocol(format!("info: missing {key}")))

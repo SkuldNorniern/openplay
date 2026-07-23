@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::env;
+use std::net::Ipv4Addr;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use openplay::Result;
 use openplay::cli::{self, CliError, Command};
 use openplay::discovery::{self, SERVICE_AIRPLAY, SERVICE_RAOP};
 
@@ -10,7 +13,7 @@ const BROWSE_WAIT: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = std::env::args().skip(1);
+    let args = env::args().skip(1);
     let cli = match cli::parse(args) {
         Ok(cli) => cli,
         Err(CliError::Help) => {
@@ -40,7 +43,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_discover(bind: Option<std::net::Ipv4Addr>) -> openplay::Result<()> {
+async fn run_discover(bind: Option<Ipv4Addr>) -> Result<()> {
     let found = discovery::browse(&[SERVICE_AIRPLAY, SERVICE_RAOP], bind, BROWSE_WAIT).await?;
     if found.is_empty() {
         println!("no receivers found");

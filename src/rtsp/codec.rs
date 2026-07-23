@@ -1,5 +1,7 @@
 //! RTSP/1.0 wire encode/decode.
 
+use std::str::from_utf8;
+
 use super::{Headers, Request, Response, VERSION};
 use crate::error::{Error, Result};
 
@@ -42,7 +44,7 @@ pub fn parse_response(buf: &[u8]) -> Result<Option<(Response, usize)>> {
 
     let mut headers = Headers::new();
     for line in lines {
-        let text = std::str::from_utf8(line).map_err(|_| Error::Rtsp("non-utf8 header".into()))?;
+        let text = from_utf8(line).map_err(|_| Error::Rtsp("non-utf8 header".into()))?;
         let (name, value) = text
             .split_once(':')
             .ok_or_else(|| Error::Rtsp("malformed header".into()))?;
@@ -97,7 +99,7 @@ fn content_length(headers: &Headers) -> Result<usize> {
 }
 
 fn parse_status_line(line: &[u8]) -> Result<(u16, String)> {
-    let text = std::str::from_utf8(line).map_err(|_| Error::Rtsp("non-utf8 status".into()))?;
+    let text = from_utf8(line).map_err(|_| Error::Rtsp("non-utf8 status".into()))?;
     let mut parts = text.splitn(3, ' ');
     let version = parts.next().unwrap_or("");
     if version != VERSION {
