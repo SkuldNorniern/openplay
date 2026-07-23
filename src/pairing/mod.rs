@@ -4,6 +4,7 @@
 //! secret, from which the ChaCha20-Poly1305 control keys are expanded. No
 //! long-term keys are persisted.
 
+pub mod srp;
 pub mod tlv;
 
 pub use tlv::{Tlv, TlvType};
