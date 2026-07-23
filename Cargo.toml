@@ -2,7 +2,7 @@
 name = "openplay"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Eira <eira@nornity.com>"]
 description = "AirPlay 2 audio sender: stream PC audio to HomePod and Apple TV"
 license = "Apache-2.0"
