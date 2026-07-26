@@ -29,19 +29,10 @@ pub struct RtpPacketBuilder {
     ssrc: u32,
     cipher: ChaCha20Poly1305,
     nonces: NonceCounter,
-    /// The marker bit is set on exactly one packet: the first sent after
-    /// `RECORD` (or, once implemented, after a future `FLUSH`) — it tells the
-    /// receiver a new stream segment is starting, e.g. to reset its jitter
-    /// buffer. Setting it on every packet makes each one look like a segment
-    /// restart, which a receiver may be free to interpret as reason to keep
-    /// resetting its buffering/timing state.
-    marker_pending: bool,
 }
 
 impl RtpPacketBuilder {
-    /// Begin a new session with a fixed SSRC. Sequence and timestamp start at
-    /// 0; the marker bit is set on the first packet built, matching a fresh
-    /// stream starting right after `RECORD`.
+    /// Begin a new session with a fixed SSRC. Sequence and timestamp start at 0.
     ///
     /// `audio_key` is the 32-byte AirPlay audio stream secret (the same value
     /// already sent to the receiver as `ekey`/`shk` during SETUP).
@@ -52,7 +43,6 @@ impl RtpPacketBuilder {
             ssrc,
             cipher: ChaCha20Poly1305::new(&Key::from(audio_key)),
             nonces: NonceCounter::new(),
-            marker_pending: true,
         }
     }
 
@@ -63,18 +53,29 @@ impl RtpPacketBuilder {
     /// sequence never wraps: reusing an audio `(key, nonce)` pair would break
     /// both confidentiality and authentication.
     ///
+    /// `marker` sets the RTP marker bit — the receiver's signal that a new
+    /// stream segment is starting (e.g. reset its jitter buffer), meant for
+    /// exactly the first packet sent after `RECORD` (or a future `FLUSH`).
+    /// This is a caller-supplied flag rather than internal state here on
+    /// purpose: only the caller (which owns the socket) knows whether a given
+    /// packet was ever actually transmitted. Deciding "first packet" inside
+    /// this builder would consume the marker at construction time even if the
+    /// send that packet depended on later failed, permanently losing the
+    /// segment-start signal on a retry — sequence/timestamp gaps from a failed
+    /// send are normal, recoverable RTP loss, but the marker is a one-shot
+    /// signal that can't be inferred from a later gap.
+    ///
     /// RTP travels over lossy, unordered UDP, so each packet transmits the
     /// eight-byte counter tail needed to reconstruct its AEAD nonce. Timestamp
     /// and SSRC remain visible for routing but are authenticated as AAD.
-    pub fn build_packet(&mut self, payload: &[u8], frame_count: u32) -> Result<Vec<u8>> {
+    pub fn build_packet(&mut self, payload: &[u8], frame_count: u32, marker: bool) -> Result<Vec<u8>> {
         let mut header = [0_u8; RTP_HEADER_LEN];
         header[0] = RTP_VERSION;
-        header[1] = if self.marker_pending {
+        header[1] = if marker {
             RTP_MARKER_BIT | RTP_PAYLOAD_TYPE
         } else {
             RTP_PAYLOAD_TYPE
         };
-        self.marker_pending = false;
         header[2..4].copy_from_slice(&self.sequence.to_be_bytes());
         header[4..8].copy_from_slice(&self.timestamp.to_be_bytes());
         header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
@@ -150,7 +151,7 @@ mod tests {
     #[test]
     fn first_packet_has_exact_rtp_header() {
         let packet = RtpPacketBuilder::new(SSRC, KEY)
-            .build_packet(b"alac", 100)
+            .build_packet(b"alac", 100, true)
             .expect("build first packet");
 
         assert_eq!(packet[0], 0x80);
@@ -164,10 +165,10 @@ mod tests {
     fn second_packet_advances_by_actual_frame_count() {
         let mut builder = RtpPacketBuilder::new(SSRC, KEY);
         let _first = builder
-            .build_packet(b"partial packet", 100)
+            .build_packet(b"partial packet", 100, true)
             .expect("build first packet");
         let second = builder
-            .build_packet(b"next packet", 7)
+            .build_packet(b"next packet", 7, false)
             .expect("build second packet");
 
         assert_eq!(sequence(&second), 1);
@@ -175,18 +176,19 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_packet_carries_the_marker_bit() {
+    fn marker_bit_reflects_the_caller_supplied_flag() {
         // The marker signals "new stream segment" to the receiver (e.g. reset
-        // its jitter buffer) right after RECORD. Setting it on every packet
-        // makes each one look like a fresh segment start.
+        // its jitter buffer). Whether a given packet is the segment start is
+        // the caller's decision (see build_packet's doc comment for why) --
+        // this builder only needs to write whatever it's told correctly.
         let mut builder = RtpPacketBuilder::new(SSRC, KEY);
-        let first = builder.build_packet(b"first", 100).expect("build first");
-        let second = builder.build_packet(b"second", 100).expect("build second");
-        let third = builder.build_packet(b"third", 100).expect("build third");
+        let marked = builder.build_packet(b"first", 100, true).expect("build marked");
+        let unmarked = builder
+            .build_packet(b"second", 100, false)
+            .expect("build unmarked");
 
-        assert_eq!(first[1], 0xe0, "first packet: marker set, PT 0x60");
-        assert_eq!(second[1], 0x60, "second packet: marker cleared");
-        assert_eq!(third[1], 0x60, "third packet: marker stays cleared");
+        assert_eq!(marked[1], 0xe0, "marker set, PT 0x60");
+        assert_eq!(unmarked[1], 0x60, "marker cleared, PT 0x60");
     }
 
     #[test]
@@ -195,10 +197,10 @@ mod tests {
         builder.sequence = u16::MAX;
 
         let last = builder
-            .build_packet(b"last sequence", 1)
+            .build_packet(b"last sequence", 1, false)
             .expect("build maximum-sequence packet");
         let wrapped = builder
-            .build_packet(b"wrapped sequence", 1)
+            .build_packet(b"wrapped sequence", 1, false)
             .expect("build wrapped-sequence packet");
 
         assert_eq!(sequence(&last), u16::MAX);
@@ -211,10 +213,10 @@ mod tests {
         builder.timestamp = u32::MAX;
 
         let last = builder
-            .build_packet(b"last timestamp", 1)
+            .build_packet(b"last timestamp", 1, false)
             .expect("build maximum-timestamp packet");
         let wrapped = builder
-            .build_packet(b"wrapped timestamp", 1)
+            .build_packet(b"wrapped timestamp", 1, false)
             .expect("build wrapped-timestamp packet");
 
         assert_eq!(timestamp(&last), u32::MAX);
@@ -225,7 +227,7 @@ mod tests {
     fn encrypted_payload_round_trips_with_transmitted_nonce_and_header_aad() {
         let payload = b"\0encoded ALAC payload\xff";
         let packet = RtpPacketBuilder::new(SSRC, KEY)
-            .build_packet(payload, 100)
+            .build_packet(payload, 100, true)
             .expect("build packet");
 
         assert_eq!(
@@ -237,7 +239,7 @@ mod tests {
     #[test]
     fn tampering_with_authenticated_header_is_detected() {
         let mut packet = RtpPacketBuilder::new(SSRC, KEY)
-            .build_packet(b"authenticated ALAC", 100)
+            .build_packet(b"authenticated ALAC", 100, true)
             .expect("build packet");
         packet[4] ^= 0x01;
 
@@ -248,10 +250,10 @@ mod tests {
     fn consecutive_packets_use_different_nonces() {
         let mut builder = RtpPacketBuilder::new(SSRC, KEY);
         let first = builder
-            .build_packet(b"first", 100)
+            .build_packet(b"first", 100, true)
             .expect("build first packet");
         let second = builder
-            .build_packet(b"second", 100)
+            .build_packet(b"second", 100, false)
             .expect("build second packet");
 
         assert_ne!(
