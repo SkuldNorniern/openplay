@@ -119,9 +119,7 @@ fn parse_status_line(line: &[u8]) -> Result<(u16, String)> {
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn split_crlf(head: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -173,18 +171,21 @@ mod tests {
 
     #[test]
     fn incomplete_returns_none() {
-        assert!(parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nab")
-            .expect("ok")
-            .is_none());
-        assert!(parse_response(b"RTSP/1.0 200 OK\r\nCSeq: 1")
-            .expect("ok")
-            .is_none());
+        assert!(
+            parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nab")
+                .expect("ok")
+                .is_none()
+        );
+        assert!(
+            parse_response(b"RTSP/1.0 200 OK\r\nCSeq: 1")
+                .expect("ok")
+                .is_none()
+        );
     }
 
     #[test]
     fn reports_consumed_for_pipelined_messages() {
-        let mut raw =
-            b"RTSP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nA".to_vec();
+        let mut raw = b"RTSP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nA".to_vec();
         let tail = b"RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
         raw.extend_from_slice(tail);
         let (_, used) = parse_response(&raw).expect("ok").expect("complete");
@@ -206,10 +207,10 @@ mod tests {
     #[test]
     fn rejects_invalid_and_conflicting_content_length() {
         assert!(parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: abc\r\n\r\n").is_err());
-        assert!(parse_response(
-            b"RTSP/1.0 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nAB"
-        )
-        .is_err());
+        assert!(
+            parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nAB")
+                .is_err()
+        );
     }
 
     #[test]

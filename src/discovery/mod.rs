@@ -77,10 +77,10 @@ pub async fn browse(
 /// Accumulates records across responses and joins them by instance/host.
 #[derive(Default)]
 struct Aggregator {
-    ptr: Vec<(String, String)>,               // service type -> instance
-    srv: BTreeMap<String, (u16, String)>,     // instance -> (port, host)
+    ptr: Vec<(String, String)>,                   // service type -> instance
+    srv: BTreeMap<String, (u16, String)>,         // instance -> (port, host)
     txt: BTreeMap<String, Vec<(String, String)>>, // instance -> pairs
-    addrs: BTreeMap<String, Vec<IpAddr>>,     // host -> addrs
+    addrs: BTreeMap<String, Vec<IpAddr>>,         // host -> addrs
 }
 
 impl Aggregator {
@@ -174,7 +174,10 @@ mod tests {
         let r = &recs[0];
         assert_eq!(r.instance, "Speaker");
         assert_eq!(r.port, 7000);
-        assert_eq!(r.addrs, vec![IpAddr::from(Ipv4Addr::new(192, 0, 2, 20))]);
+        assert_eq!(
+            r.addrs,
+            vec![IpAddr::from(Ipv4Addr::new(192, 0, 2, 20))]
+        );
         assert_eq!(r.txt.get("model").map(String::as_str), Some("J305"));
     }
 

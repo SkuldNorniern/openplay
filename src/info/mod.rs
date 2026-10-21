@@ -50,8 +50,9 @@ impl DeviceInfo {
             source_version: string_field(dict, "sourceVersion")?,
             features: u64_field(dict, "features")?,
             status_flags: match dict.get("statusFlags") {
-                Some(v) => plist_uint(v)
-                    .ok_or_else(|| Error::Protocol("info: bad statusFlags".into()))?,
+                Some(v) => {
+                    plist_uint(v).ok_or_else(|| Error::Protocol("info: bad statusFlags".into()))?
+                }
                 None => 0,
             },
             public_key: public_key(dict)?,
@@ -96,7 +97,11 @@ fn u64_field(dict: &Dictionary, key: &str) -> Result<u64> {
 }
 
 /// Connect to `addr` (optionally from local `bind`) and fetch `/info`.
-pub async fn fetch(addr: SocketAddr, bind: Option<Ipv4Addr>, user_agent: &str) -> Result<DeviceInfo> {
+pub async fn fetch(
+    addr: SocketAddr,
+    bind: Option<Ipv4Addr>,
+    user_agent: &str,
+) -> Result<DeviceInfo> {
     let socket = match addr {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,

@@ -13,11 +13,27 @@ const TYPE_SRV: u16 = 33;
 /// A resource record we care about for AirPlay discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rr {
-    Ptr { name: String, target: String },
-    Srv { name: String, port: u16, target: String },
-    Txt { name: String, pairs: Vec<(String, String)> },
-    A { name: String, addr: Ipv4Addr },
-    Aaaa { name: String, addr: Ipv6Addr },
+    Ptr {
+        name: String,
+        target: String,
+    },
+    Srv {
+        name: String,
+        port: u16,
+        target: String,
+    },
+    Txt {
+        name: String,
+        pairs: Vec<(String, String)>,
+    },
+    A {
+        name: String,
+        addr: Ipv4Addr,
+    },
+    Aaaa {
+        name: String,
+        addr: Ipv6Addr,
+    },
 }
 
 fn u16_at(data: &[u8], pos: usize) -> Result<u16> {
