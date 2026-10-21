@@ -6,6 +6,7 @@
 //! audio device built on it survives Wi-Fi hiccups without the OS noticing.
 
 use std::fmt;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::pin;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use log::warn;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 use tokio::{select, spawn};
 
 use crate::audio::{AudioInput, AudioSource, PcmFormat, SourceStats};
@@ -31,6 +32,8 @@ const SAMPLE_RATE: f64 = 44_100.0;
 const FIRST_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 const COMMAND_QUEUE: usize = 8;
+/// A session this long-lived resets the retry count and backoff.
+const STABLE_SESSION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamMode {
@@ -213,14 +216,29 @@ async fn run(
     let mut attempt = 0_u32;
     loop {
         status.send_replace(Status::Connecting);
-        let started = match config.mode {
-            StreamMode::Realtime => session::start(addr, options, source.clone()).await,
-            StreamMode::Buffered => session::start_buffered(addr, options, source.clone()).await,
+        let mode = config.mode;
+        let start = async {
+            match mode {
+                StreamMode::Realtime => session::start(addr, options, source.clone()).await,
+                StreamMode::Buffered => {
+                    session::start_buffered(addr, options, source.clone()).await
+                }
+            }
+        };
+        let Some(started) = until_stopped(start, &mut config, &mut commands).await else {
+            status.send_replace(Status::Stopped);
+            return;
         };
         let ended = match started {
             Ok(streaming) => {
-                attempt = 0;
-                stream(streaming, &mut config, &status, &mut commands).await
+                let began = Instant::now();
+                let ended = stream(streaming, &mut config, &status, &mut commands).await;
+                // Only a session that held up counts as recovered; one that
+                // dies right after setup keeps backing off.
+                if began.elapsed() >= STABLE_SESSION {
+                    attempt = 0;
+                }
+                ended
             }
             Err(error) => Ended::Failed(error),
         };
@@ -244,9 +262,34 @@ async fn run(
             attempt,
             error: error.to_string(),
         });
-        if wait_or_stop(retry_delay(attempt), &mut commands).await {
+        if until_stopped(sleep(retry_delay(attempt)), &mut config, &mut commands)
+            .await
+            .is_none()
+        {
             status.send_replace(Status::Stopped);
             return;
+        }
+    }
+}
+
+/// Drive `work` while no session is up, answering commands meanwhile:
+/// a volume is kept for the next session, a stop abandons `work`.
+async fn until_stopped<T>(
+    work: impl Future<Output = T>,
+    config: &mut SenderConfig,
+    commands: &mut mpsc::Receiver<Command>,
+) -> Option<T> {
+    let mut work = pin!(work);
+    loop {
+        select! {
+            done = &mut work => return Some(done),
+            command = commands.recv() => match command {
+                Some(Command::SetVolume(percent, reply)) => {
+                    config.volume = Some(percent);
+                    let _ = reply.send(Ok(()));
+                }
+                Some(Command::Stop) | None => return None,
+            },
         }
     }
 }
@@ -261,7 +304,13 @@ async fn stream(
     if let Some(volume) = config.volume
         && let Err(error) = streaming.set_volume(volume).await
     {
-        return Ended::Failed(error);
+        if !streaming.is_control_healthy() {
+            return Ended::Failed(error);
+        }
+        // A receiver may refuse a volume; that is no reason to drop audio
+        // or to retry it on every reconnect.
+        warn!("volume {volume} rejected: {error}");
+        config.volume = None;
     }
     let receiver_frames = streaming
         .receiver_latency_frames()
@@ -282,16 +331,20 @@ async fn stream(
             })
             .await;
         if let Err(error) = outcome {
-            return Ended::Failed(error);
+            return end_failed(streaming, error).await;
         }
         match next {
             Some(Command::SetVolume(percent, reply)) => {
-                config.volume = Some(percent);
                 let result = streaming.set_volume(percent).await;
+                if result.is_ok() {
+                    config.volume = Some(percent);
+                }
                 let failed = result.as_ref().err().map(ToString::to_string);
                 let _ = reply.send(result);
-                if let Some(error) = failed {
-                    return Ended::Failed(Error::Rtsp(error));
+                if let Some(error) = failed
+                    && !streaming.is_control_healthy()
+                {
+                    return end_failed(streaming, Error::Session(error)).await;
                 }
             }
             // A dropped handle means nobody can stop us later; stop now.
@@ -305,20 +358,15 @@ async fn stream(
     }
 }
 
-/// Sleep before a retry; returns true if a stop arrived meanwhile.
-async fn wait_or_stop(delay: Duration, commands: &mut mpsc::Receiver<Command>) -> bool {
-    let mut deadline = pin!(sleep(delay));
-    loop {
-        select! {
-            () = &mut deadline => return false,
-            command = commands.recv() => match command {
-                Some(Command::SetVolume(_, reply)) => {
-                    let _ = reply.send(Err(Error::Protocol("not connected".to_owned())));
-                }
-                Some(Command::Stop) | None => return true,
-            },
-        }
+/// End a failed session, telling the receiver when the control connection
+/// still works, so the reconnect is not ignored as a duplicate.
+async fn end_failed(streaming: Streaming, error: Error) -> Ended {
+    if streaming.is_control_healthy()
+        && let Err(teardown_error) = streaming.teardown().await
+    {
+        warn!("teardown after failure: {teardown_error}");
     }
+    Ended::Failed(error)
 }
 
 fn duration_frames(duration: Duration) -> u32 {
@@ -410,7 +458,8 @@ mod tests {
         .expect("reconnecting in time")
         .expect("status open");
 
-        assert!(sender.set_volume(50).await.is_err());
+        // Kept for the next session while disconnected.
+        assert!(sender.set_volume(50).await.is_ok());
         timeout(Duration::from_secs(1), sender.stop())
             .await
             .expect("stops promptly");
