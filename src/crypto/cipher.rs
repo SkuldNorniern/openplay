@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce};
 
 use super::nonce::NonceCounter;
 use crate::error::{Error, Result};
@@ -38,10 +39,16 @@ impl SealingKey {
     /// the nonce drawn for the failed attempt is not recoverable, so retrying
     /// or continuing on this instance would desynchronize it from the peer.
     /// The caller must tear down the channel and re-pair.
-    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = Nonce::from(self.nonces.next()?);
         self.cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|_| Error::Crypto("aead: encryption failed".to_owned()))
     }
 }
@@ -80,10 +87,16 @@ impl OpeningKey {
     /// control channel: the nonce advances regardless of outcome, so any
     /// message processed after a failure is checked against the wrong nonce.
     /// The caller must tear down the channel and re-pair, not retry.
-    pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+    pub fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
         let nonce = Nonce::from(self.nonces.next()?);
         self.cipher
-            .decrypt(&nonce, ciphertext)
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|_| Error::Crypto("aead: authentication failed".to_owned()))
     }
 }
@@ -98,6 +111,9 @@ impl fmt::Debug for OpeningKey {
 mod tests {
     use super::*;
 
+    /// Record length prefix, as the control channel authenticates it.
+    const AAD: &[u8] = &[0x0d, 0x00];
+
     #[test]
     fn round_trips_different_plaintexts_and_keys() {
         for (key, plaintext) in [
@@ -106,9 +122,9 @@ mod tests {
         ] {
             let mut sealing = SealingKey::new(key);
             let mut opening = OpeningKey::new(key);
-            let ciphertext = sealing.seal(plaintext).expect("seal");
+            let ciphertext = sealing.seal(AAD, plaintext).expect("seal");
 
-            assert_eq!(opening.open(&ciphertext).expect("open"), plaintext);
+            assert_eq!(opening.open(AAD, &ciphertext).expect("open"), plaintext);
         }
     }
 
@@ -124,11 +140,11 @@ mod tests {
         let mut opening = OpeningKey::new(key);
         let ciphertexts: Vec<_> = messages
             .iter()
-            .map(|message| sealing.seal(message).expect("seal"))
+            .map(|message| sealing.seal(AAD, message).expect("seal"))
             .collect();
 
         for (ciphertext, message) in ciphertexts.iter().zip(messages) {
-            assert_eq!(opening.open(ciphertext).expect("open"), message);
+            assert_eq!(opening.open(AAD, ciphertext).expect("open"), message);
         }
     }
 
@@ -136,31 +152,41 @@ mod tests {
     fn tampered_ciphertext_fails_authentication() {
         let key = [0x33; 32];
         let mut sealing = SealingKey::new(key);
-        let mut ciphertext = sealing.seal(b"authenticated").expect("seal");
+        let mut ciphertext = sealing.seal(AAD, b"authenticated").expect("seal");
         ciphertext[0] ^= 0x80;
         let mut opening = OpeningKey::new(key);
 
-        assert!(opening.open(&ciphertext).is_err());
+        assert!(opening.open(AAD, &ciphertext).is_err());
+    }
+
+    #[test]
+    fn different_length_prefix_fails_authentication() {
+        let key = [0x66; 32];
+        let mut sealing = SealingKey::new(key);
+        let ciphertext = sealing.seal(AAD, b"length bound").expect("seal");
+        let mut opening = OpeningKey::new(key);
+
+        assert!(opening.open(&[0x0e, 0x00], &ciphertext).is_err());
     }
 
     #[test]
     fn wrong_key_fails_authentication() {
         let mut sealing = SealingKey::new([0x44; 32]);
-        let ciphertext = sealing.seal(b"secret").expect("seal");
+        let ciphertext = sealing.seal(AAD, b"secret").expect("seal");
         let mut opening = OpeningKey::new([0x45; 32]);
 
-        assert!(opening.open(&ciphertext).is_err());
+        assert!(opening.open(AAD, &ciphertext).is_err());
     }
 
     #[test]
     fn out_of_order_message_fails_authentication() {
         let key = [0x55; 32];
         let mut sealing = SealingKey::new(key);
-        let _first = sealing.seal(b"first").expect("seal first");
-        let second = sealing.seal(b"second").expect("seal second");
+        let _first = sealing.seal(AAD, b"first").expect("seal first");
+        let second = sealing.seal(AAD, b"second").expect("seal second");
         let mut opening = OpeningKey::new(key);
 
-        assert!(opening.open(&second).is_err());
+        assert!(opening.open(AAD, &second).is_err());
     }
 
     #[test]

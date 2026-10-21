@@ -9,6 +9,9 @@ use crate::rtsp::{self, Request, Response};
 
 const AUTH_TAG_LEN: usize = 16;
 const READ_CHUNK_LEN: usize = 2048;
+/// HomeKit encrypted frames carry at most this much plaintext each, so a
+/// longer message is split across consecutive frames in both directions.
+const MAX_RECORD_PLAINTEXT: usize = 1024;
 
 /// Upper bound on a buffered plaintext response. `rtsp::parse_response` has no
 /// size cap of its own, so without this a peer that never sends a terminating
@@ -69,21 +72,20 @@ where
 
     /// Send one complete RTSP request in the channel's current wire mode.
     ///
-    /// Once encrypted, a request is capped at 65535 bytes: the record framing
-    /// uses a 2-byte length prefix and this protocol has no multi-record
-    /// fragmentation for a single message. Pairing and SETUP/RECORD control
-    /// messages are all comfortably under this; a future request built around
-    /// a large embedded blob (e.g. artwork) would need its own framing, not
-    /// just a bigger integer here.
+    /// Once encrypted, the request goes out as one or more frames of at most
+    /// [`MAX_RECORD_PLAINTEXT`] bytes, each with its own length prefix.
     pub async fn send(&mut self, request: &Request) -> Result<()> {
         let plaintext = request.encode();
         if let Some(sealing) = self.sealing.as_mut() {
-            let plaintext_len = u16::try_from(plaintext.len()).map_err(|_| {
-                Error::Protocol("encrypted RTSP request exceeds record length".to_owned())
-            })?;
-            let ciphertext = sealing.seal(&plaintext)?;
-            self.stream.write_all(&plaintext_len.to_le_bytes()).await?;
-            self.stream.write_all(&ciphertext).await?;
+            for chunk in plaintext.chunks(MAX_RECORD_PLAINTEXT) {
+                let length = u16::try_from(chunk.len())
+                    .map_err(|_| Error::Protocol("encrypted record too long".to_owned()))?
+                    .to_le_bytes();
+                // The length prefix is authenticated as AAD, as HomeKit framing requires.
+                let ciphertext = sealing.seal(&length, chunk)?;
+                self.stream.write_all(&length).await?;
+                self.stream.write_all(&ciphertext).await?;
+            }
         } else {
             self.stream.write_all(&plaintext).await?;
         }
@@ -123,29 +125,31 @@ where
         }
     }
 
+    /// Decrypt frames until they add up to one RTSP response. A response
+    /// longer than one frame, such as `/info`, spans several.
     async fn receive_encrypted(&mut self) -> Result<Response> {
-        let mut length = [0_u8; 2];
-        read_fully(&mut self.stream, &mut length, "encrypted record length").await?;
-        let plaintext_len = usize::from(u16::from_le_bytes(length));
-        let ciphertext_len = plaintext_len.checked_add(AUTH_TAG_LEN).ok_or_else(|| {
-            Error::Protocol("encrypted control record length overflow".to_owned())
-        })?;
-        let mut ciphertext = vec![0_u8; ciphertext_len];
-        read_fully(&mut self.stream, &mut ciphertext, "encrypted record body").await?;
+        loop {
+            if let Some((response, consumed)) = rtsp::parse_response(&self.read_buf)? {
+                self.read_buf.drain(..consumed);
+                return Ok(response);
+            }
 
-        let opening = self
-            .opening
-            .as_mut()
-            .ok_or_else(|| Error::Protocol("encrypted transport has no opening key".to_owned()))?;
-        let plaintext = opening.open(&ciphertext)?;
-        match rtsp::parse_response(&plaintext)? {
-            Some((response, consumed)) if consumed == plaintext.len() => Ok(response),
-            Some(_) => Err(Error::Protocol(
-                "encrypted record contains more than one RTSP message".to_owned(),
-            )),
-            None => Err(Error::Protocol(
-                "encrypted record contains an incomplete RTSP response".to_owned(),
-            )),
+            let mut length = [0_u8; 2];
+            read_fully(&mut self.stream, &mut length, "encrypted record length").await?;
+            let plaintext_len = usize::from(u16::from_le_bytes(length));
+            let mut ciphertext = vec![0_u8; plaintext_len + AUTH_TAG_LEN];
+            read_fully(&mut self.stream, &mut ciphertext, "encrypted record body").await?;
+
+            let opening = self.opening.as_mut().ok_or_else(|| {
+                Error::Protocol("encrypted transport has no opening key".to_owned())
+            })?;
+            let plaintext = opening.open(&length, &ciphertext)?;
+            self.read_buf.extend_from_slice(&plaintext);
+            if self.read_buf.len() > MAX_PLAINTEXT_RESPONSE {
+                return Err(Error::Protocol(
+                    "encrypted RTSP response exceeded the maximum buffered size".to_owned(),
+                ));
+            }
         }
     }
 }
@@ -232,7 +236,9 @@ mod tests {
         transport.upgrade(keys()).expect("upgrade");
 
         let mut peer_sealing = SealingKey::new(READ_KEY);
-        let ciphertext = peer_sealing.seal(RESPONSE).expect("seal response");
+        let ciphertext = peer_sealing
+            .seal(&(RESPONSE.len() as u16).to_le_bytes(), RESPONSE)
+            .expect("seal response");
         peer.write_all(&(RESPONSE.len() as u16).to_le_bytes())
             .await
             .expect("write response length");
@@ -250,8 +256,57 @@ mod tests {
         transport.send(&request).await.expect("send request");
         let ciphertext = read_record(&mut peer).await;
         let mut peer_opening = OpeningKey::new(WRITE_KEY);
-        let plaintext = peer_opening.open(&ciphertext).expect("open request");
+        let plaintext = peer_opening
+            .open(&(expected.len() as u16).to_le_bytes(), &ciphertext)
+            .expect("open request");
         assert_eq!(plaintext, expected);
+    }
+
+    #[tokio::test]
+    async fn long_request_is_split_into_1024_byte_frames() {
+        let (client, mut peer) = duplex(8192);
+        let mut transport = ControlTransport::new(client);
+        transport.upgrade(keys()).expect("upgrade");
+        let request = Request::new("SETUP", "/1").body(vec![0x5a; 1500]);
+        let expected = request.encode();
+
+        transport.send(&request).await.expect("send request");
+        let mut peer_opening = OpeningKey::new(WRITE_KEY);
+        let mut received = Vec::new();
+        let mut frame_lengths = Vec::new();
+        while received.len() < expected.len() {
+            let ciphertext = read_record(&mut peer).await;
+            let length = ciphertext.len() - AUTH_TAG_LEN;
+            frame_lengths.push(length);
+            let length = u16::try_from(length).expect("frame length").to_le_bytes();
+            received.extend(peer_opening.open(&length, &ciphertext).expect("open frame"));
+        }
+
+        assert_eq!(received, expected);
+        assert_eq!(frame_lengths, [1024, expected.len() - 1024]);
+    }
+
+    #[tokio::test]
+    async fn response_spanning_frames_is_reassembled() {
+        let (client, mut peer) = duplex(8192);
+        let mut transport = ControlTransport::new(client);
+        transport.upgrade(keys()).expect("upgrade");
+        let mut response = b"RTSP/1.0 200 OK\r\nContent-Length: 1500\r\n\r\n".to_vec();
+        response.extend([0x5a; 1500]);
+
+        let mut peer_sealing = SealingKey::new(READ_KEY);
+        for chunk in response.chunks(1024) {
+            let length = u16::try_from(chunk.len())
+                .expect("frame length")
+                .to_le_bytes();
+            let ciphertext = peer_sealing.seal(&length, chunk).expect("seal frame");
+            peer.write_all(&length).await.expect("write length");
+            peer.write_all(&ciphertext).await.expect("write frame");
+        }
+
+        let response = transport.receive().await.expect("receive response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, vec![0x5a; 1500]);
     }
 
     #[tokio::test]
@@ -288,7 +343,9 @@ mod tests {
         let mut transport = ControlTransport::new(client);
         transport.upgrade(keys()).expect("upgrade");
         let mut peer_sealing = SealingKey::new(READ_KEY);
-        let ciphertext = peer_sealing.seal(RESPONSE).expect("seal response");
+        let ciphertext = peer_sealing
+            .seal(&(RESPONSE.len() as u16).to_le_bytes(), RESPONSE)
+            .expect("seal response");
         let length = (RESPONSE.len() as u16).to_le_bytes();
 
         peer.write_all(&length[..1])
