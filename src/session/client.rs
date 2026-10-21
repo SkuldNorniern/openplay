@@ -1,8 +1,10 @@
 //! RTSP request/response client for one control connection.
 
+use std::io::Cursor;
 use std::time::Duration;
 
-use log::debug;
+use log::{Level, debug, log_enabled};
+use plist::Value;
 use rand::random;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
@@ -108,6 +110,9 @@ where
             response.reason,
             response.body.len()
         );
+        if log_enabled!(Level::Debug) {
+            log_response_details(&response);
+        }
         if !response.is_success() {
             return Err(Error::Rtsp(format!(
                 "{method} {uri}: status {} {}",
@@ -127,6 +132,23 @@ where
             .header("User-Agent", USER_AGENT)
             .header("X-Apple-Client-Name", CLIENT_NAME)
             .header("X-Apple-Device-ID", self.identity.device_id_colons())
+    }
+}
+
+/// Headers and plist bodies, for learning what a receiver reports, such as
+/// its playout latency.
+fn log_response_details(response: &Response) {
+    for (name, value) in response.headers.iter() {
+        if !matches!(name, "CSeq" | "Content-Length" | "Date") {
+            debug!("rtsp <<   {name}: {value}");
+        }
+    }
+    let is_plist = response
+        .headers
+        .get("Content-Type")
+        .is_some_and(|kind| kind.contains("plist"));
+    if is_plist && let Ok(body) = Value::from_reader(Cursor::new(&response.body)) {
+        debug!("rtsp <<   {body:?}");
     }
 }
 
