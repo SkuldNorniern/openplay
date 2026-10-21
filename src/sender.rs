@@ -231,6 +231,10 @@ async fn run(
         };
         let ended = match started {
             Ok(streaming) => {
+                // Drop what queued up while disconnected, so the session
+                // starts at target latency instead of working the backlog
+                // off slowly through drift correction.
+                source.restart_at(config.target_frames);
                 let began = Instant::now();
                 let ended = stream(streaming, &mut config, &status, &mut commands).await;
                 // Only a session that held up counts as recovered; one that

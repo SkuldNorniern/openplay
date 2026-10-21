@@ -34,6 +34,9 @@ pub enum WriteOutcome {
 struct Counters {
     underrun_frames: AtomicU64,
     overrun_frames: AtomicU64,
+    /// Bumped by [`AudioSource::restart_at`], so writers can tell a new
+    /// session began.
+    epoch: AtomicU64,
 }
 
 /// Running totals for diagnostics and UI.
@@ -104,6 +107,22 @@ impl AudioSource {
     /// Frames currently buffered.
     pub fn buffered_frames(&self) -> usize {
         self.lock().len() / CHANNELS
+    }
+
+    /// Start a new session at `frames` of buffering: audio queued while no
+    /// session was draining it is dropped, oldest first, instead of adding
+    /// its whole backlog to the new session's latency.
+    pub fn restart_at(&self, frames: usize) {
+        let mut ring = self.lock();
+        let excess = ring.len().saturating_sub(frames * CHANNELS);
+        ring.drain(..excess);
+        drop(ring);
+        self.stats.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Changes each time [`Self::restart_at`] runs.
+    pub fn epoch(&self) -> u64 {
+        self.stats.epoch.load(Ordering::Relaxed)
     }
 
     pub fn capacity_frames(&self) -> usize {
@@ -180,6 +199,18 @@ mod tests {
         assert_eq!(source.write(&[1, 1, 2, 2, 3, 3]), WriteOutcome::Overrun);
         assert_eq!(source.read(2), [2, 2, 3, 3]);
         assert_eq!(source.stats().overrun_frames, 2);
+    }
+
+    #[test]
+    fn restart_keeps_only_the_newest_target_frames() {
+        let source = AudioSource::new(8);
+        source.write(&[1, 1, 2, 2, 3, 3, 4, 4]);
+        let epoch = source.epoch();
+
+        source.restart_at(1);
+        assert_eq!(source.read(1), [4, 4]);
+        assert_ne!(source.epoch(), epoch);
+        assert_eq!(source.stats(), SourceStats::default());
     }
 
     #[test]

@@ -14,10 +14,10 @@ const MAX_ADJUSTMENT_PPM: f64 = 1_000.0;
 /// constant is about 25 s at a quarter-second target, slow enough that the
 /// 352-frame steps of the sender's reads cause no audible wobble.
 const ADJUSTMENT_GAIN_PPM: f64 = 10_000.0;
-/// Weight of each write in the smoothed fill level. With 10 ms engine
-/// periods this averages over about a second, hiding the 352-frame steps
-/// of the sender's reads.
-const FILL_SMOOTHING: f64 = 0.01;
+/// Time the smoothed fill level averages over, in output frames: about a
+/// second, hiding the 352-frame steps of the sender's reads whatever size
+/// the writes come in.
+const FILL_SMOOTHING_FRAMES: f64 = 44_100.0;
 
 /// Keeps the ring near a target fill by nudging the resampler, so a source
 /// clock that runs slightly fast or slow against the sender never drains
@@ -25,11 +25,27 @@ const FILL_SMOOTHING: f64 = 0.01;
 struct DriftControl {
     target_frames: f64,
     smoothed_frames: f64,
+    /// Source epoch the smoothing belongs to.
+    epoch: u64,
 }
 
 impl DriftControl {
-    fn adjustment_ppm(&mut self, buffered_frames: usize) -> i32 {
-        self.smoothed_frames += FILL_SMOOTHING * (buffered_frames as f64 - self.smoothed_frames);
+    /// Fold in the fill seen after writing `written` frames, and return the
+    /// correction for the next write.
+    ///
+    /// The target applies to the ring's low point, just before a write:
+    /// between writes the sender drains a whole write's worth, so holding
+    /// any higher point at target would let the ring run dry each cycle.
+    /// A new session restarts the average at target rather than at the
+    /// backlog that built up while nothing was draining.
+    fn update(&mut self, buffered_after: usize, written: usize, epoch: u64) -> i32 {
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.smoothed_frames = self.target_frames;
+        }
+        let low_point = buffered_after.saturating_sub(written) as f64;
+        let weight = 1.0 - (-(written as f64) / FILL_SMOOTHING_FRAMES).exp();
+        self.smoothed_frames += weight * (low_point - self.smoothed_frames);
         let error = (self.smoothed_frames - self.target_frames) / self.target_frames;
         (error * ADJUSTMENT_GAIN_PPM).clamp(-MAX_ADJUSTMENT_PPM, MAX_ADJUSTMENT_PPM) as i32
     }
@@ -80,6 +96,7 @@ impl AudioInput {
         self.drift = Some(DriftControl {
             target_frames: target_frames.max(1) as f64,
             smoothed_frames: target_frames as f64,
+            epoch: self.source.epoch(),
         });
         self
     }
@@ -109,9 +126,6 @@ impl AudioInput {
         decode_stereo(self.format, &rest[..whole], &mut self.decoded);
         self.partial.extend_from_slice(&rest[whole..]);
 
-        if let (Some(drift), Some(resampler)) = (&mut self.drift, &mut self.resampler) {
-            resampler.set_adjustment_ppm(drift.adjustment_ppm(self.source.buffered_frames()));
-        }
         let frames = match &mut self.resampler {
             Some(resampler) => {
                 self.resampled.clear();
@@ -120,9 +134,16 @@ impl AudioInput {
             }
             None => &self.decoded,
         };
+        let written = frames.len();
         self.samples.clear();
         quantize_i16(frames, &mut self.samples);
-        self.source.write(&self.samples)
+        let outcome = self.source.write(&self.samples);
+
+        if let (Some(drift), Some(resampler)) = (&mut self.drift, &mut self.resampler) {
+            let ppm = drift.update(self.source.buffered_frames(), written, self.source.epoch());
+            resampler.set_adjustment_ppm(ppm);
+        }
+        outcome
     }
 }
 
@@ -233,6 +254,36 @@ mod tests {
         // About 1100 frames gained in two minutes, and still climbing.
         let fill = source.buffered_frames();
         assert!(fill > 12_000, "fill {fill}");
+    }
+
+    #[test]
+    fn large_writes_never_run_the_ring_dry() {
+        // A source handing over 100 ms at a time, read in ten 10 ms slices.
+        let source = AudioSource::new(22_050);
+        let mut input = AudioInput::new(float_48k(), source.clone())
+            .expect("input")
+            .with_drift_correction(2_205);
+        let silence = vec![0_u8; 4_800 * 8];
+        // A session starts at target, as `Sender` trims to it on connect.
+        source.write(&vec![0; 2_205 * 2]);
+        source.restart_at(2_205);
+
+        let mut low_points = Vec::new();
+        for _ in 0..1_800 {
+            low_points.push(source.buffered_frames());
+            input.write(&silence);
+            for _ in 0..10 {
+                source.read(441);
+            }
+        }
+        let settled = &low_points[low_points.len() - 100..];
+        let lowest = settled.iter().min().copied().unwrap_or_default();
+        let highest = settled.iter().max().copied().unwrap_or_default();
+        assert!(
+            (1_800..=2_700).contains(&lowest) && highest <= 2_700,
+            "low points {lowest}..{highest}"
+        );
+        assert_eq!(source.stats().underrun_frames, 0);
     }
 
     #[test]
