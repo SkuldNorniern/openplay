@@ -15,6 +15,7 @@ pub mod error;
 pub mod info;
 pub mod logging;
 pub mod pairing;
+pub mod ptp;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
