@@ -1,5 +1,7 @@
 //! Minimal stderr backend for the `log` facade, so no logger crate is needed.
 
+use std::io::{Write, stderr};
+
 use log::{
     Level, LevelFilter, Log, Metadata, Record, SetLoggerError, max_level, set_logger, set_max_level,
 };
@@ -24,7 +26,9 @@ impl Log for StderrLogger {
             Level::Debug => "debug",
             Level::Trace => "trace",
         };
-        eprintln!("{level}: {}", record.args());
+        // A closed stderr (say, piped into `head`) must not panic the
+        // thread that logged.
+        let _ = writeln!(stderr(), "{level}: {}", record.args());
     }
 
     fn flush(&self) {}
