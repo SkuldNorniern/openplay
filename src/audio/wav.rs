@@ -41,66 +41,94 @@ pub fn parse_wav(bytes: &[u8]) -> Result<WavAudio> {
     if bytes.get(0..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WAVE") {
         return Err(Error::Protocol("wav: missing RIFF/WAVE header".into()));
     }
-    let riff_size = read_u32(bytes, 4, "RIFF size")? as usize;
+    let riff_size = read_u32(bytes, 4, "RIFF size")?;
     // The declared size excludes the 8-byte "RIFF"+size header itself, so the
     // container's chunks end at offset 8 + riff_size. A parser that instead
     // scanned to the end of the buffer would happily decode trailing bytes
     // appended after a (possibly truncated or polyglot) WAV container.
-    let riff_end = 8usize
-        .checked_add(riff_size)
-        .ok_or_else(|| Error::Protocol("wav: RIFF size overflow".into()))?
-        .min(bytes.len());
+    // Streaming writers that cannot seek back leave the size 0 or all ones,
+    // meaning "until the end".
+    let riff_end = if riff_size == 0 || riff_size == u32::MAX {
+        bytes.len()
+    } else {
+        8usize
+            .checked_add(riff_size as usize)
+            .ok_or_else(|| Error::Protocol("wav: RIFF size overflow".into()))?
+            .min(bytes.len())
+    };
 
     let mut cursor = 12usize;
     let mut format = None;
-    let mut data = None;
+    let mut data: Option<&[u8]> = None;
+    let mut data_truncated = false;
 
     while cursor < riff_end {
         let header_end = cursor
             .checked_add(8)
             .ok_or_else(|| Error::Protocol("wav: chunk header offset overflow".into()))?;
-        let header = bytes
-            .get(cursor..header_end)
-            .ok_or_else(|| Error::Protocol("wav: truncated chunk header".into()))?;
-        let chunk_id = header
-            .get(0..4)
-            .ok_or_else(|| Error::Protocol("wav: truncated chunk id".into()))?;
+        let Some(header) = bytes.get(cursor..header_end) else {
+            // Trailing bytes after complete audio are not worth failing on.
+            if format.is_some() && data.is_some() {
+                break;
+            }
+            return Err(Error::Protocol("wav: truncated chunk header".into()));
+        };
+        let chunk_id = &header[0..4];
         let chunk_size = read_u32(header, 4, "chunk size")? as usize;
-        if chunk_id == b"data" && chunk_size > MAX_DATA_LEN {
-            return Err(Error::Protocol(format!(
-                "wav: data chunk length {chunk_size} exceeds maximum {MAX_DATA_LEN}"
-            )));
-        }
         let data_start = header_end;
         let data_end = data_start
             .checked_add(chunk_size)
             .ok_or_else(|| Error::Protocol("wav: chunk size overflow".into()))?;
-        let chunk = bytes
-            .get(data_start..data_end)
-            .ok_or_else(|| Error::Protocol("wav: chunk extends past end of file".into()))?;
+
+        let chunk = match bytes.get(data_start..data_end) {
+            Some(chunk) => chunk,
+            // A recording cut short, or streamed with a placeholder size,
+            // still holds usable audio up to where the file ends.
+            None if chunk_id == b"data" && data.is_none() => {
+                data_truncated = true;
+                &bytes[data_start.min(bytes.len())..]
+            }
+            None if format.is_some() && data.is_some() => break,
+            None => {
+                return Err(Error::Protocol(
+                    "wav: chunk extends past end of file".into(),
+                ));
+            }
+        };
+        if chunk_id == b"data" && chunk.len() > MAX_DATA_LEN {
+            return Err(Error::Protocol(format!(
+                "wav: data chunk length {} exceeds maximum {MAX_DATA_LEN}",
+                chunk.len()
+            )));
+        }
 
         match chunk_id {
             b"fmt " if format.is_none() => format = Some(parse_format(chunk)?),
             b"data" if data.is_none() => data = Some(chunk),
             _ => {}
         }
-
-        let padding = chunk_size % 2;
-        cursor = data_end
-            .checked_add(padding)
-            .ok_or_else(|| Error::Protocol("wav: chunk padding offset overflow".into()))?;
-        if cursor > bytes.len() {
-            return Err(Error::Protocol("wav: missing chunk padding byte".into()));
+        if data_truncated {
+            break;
         }
+
+        // Odd-sized chunks are padded to even length; writers that leave the
+        // pad off the final chunk lose nothing.
+        cursor = data_end
+            .checked_add(chunk_size % 2)
+            .ok_or_else(|| Error::Protocol("wav: chunk padding offset overflow".into()))?;
     }
 
     let format = format.ok_or_else(|| Error::Protocol("wav: missing fmt chunk".into()))?;
     let format = pcm_format(format)?;
-    let data = data.ok_or_else(|| Error::Protocol("wav: missing data chunk".into()))?;
-    if data.len() % format.bytes_per_frame() != 0 {
-        return Err(Error::Protocol(
-            "wav: data length is not a whole number of frames".into(),
-        ));
+    let mut data = data.ok_or_else(|| Error::Protocol("wav: missing data chunk".into()))?;
+    let partial = data.len() % format.bytes_per_frame();
+    if partial != 0 {
+        if !data_truncated {
+            return Err(Error::Protocol(
+                "wav: data length is not a whole number of frames".into(),
+            ));
+        }
+        data = &data[..data.len() - partial];
     }
 
     Ok(WavAudio {
@@ -115,6 +143,7 @@ struct WaveFormat {
     channels: u16,
     sample_rate: u32,
     bits_per_sample: u16,
+    block_align: u16,
     /// Real format tag of an extensible header.
     subformat: Option<u16>,
 }
@@ -129,6 +158,7 @@ fn parse_format(chunk: &[u8]) -> Result<WaveFormat> {
         audio_format: read_u16(chunk, 0, "audio format")?,
         channels: read_u16(chunk, 2, "channel count")?,
         sample_rate: read_u32(chunk, 4, "sample rate")?,
+        block_align: read_u16(chunk, 12, "block align")?,
         bits_per_sample: read_u16(chunk, 14, "bits per sample")?,
         subformat: read_u16(chunk, SUBFORMAT_OFFSET, "sub-format").ok(),
     })
@@ -161,6 +191,15 @@ fn pcm_format(format: WaveFormat) -> Result<PcmFormat> {
         sample,
     };
     pcm.validate()?;
+    if usize::from(format.block_align) != pcm.bytes_per_frame() {
+        // Decoding at the wrong stride would turn the audio into noise.
+        return Err(Error::Protocol(format!(
+            "wav: block align {} does not match {} channels of {} bytes",
+            format.block_align,
+            pcm.channels,
+            pcm.sample.bytes()
+        )));
+    }
     Ok(pcm)
 }
 
@@ -325,22 +364,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_data_chunk_larger_than_limit() {
+    fn huge_declared_data_size_reads_only_present_bytes() {
+        // The size alone allocates nothing: only bytes in the file are used.
         let mut bytes = wave(1, 2, 44_100, 16);
         bytes.truncate(bytes.len() - 4);
-        bytes.extend_from_slice(&((MAX_DATA_LEN as u32) + 4).to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0, 2, 0, 3, 0, 4, 0, 9]);
 
-        // The declared-length limit is checked from the chunk header, before
-        // bounds-checking or allocating storage for the absent payload.
-        assert!(matches!(
-            parse_wav(&bytes),
-            Err(Error::Protocol(message))
-                if message
-                    == format!(
-                        "wav: data chunk length {} exceeds maximum {MAX_DATA_LEN}",
-                        MAX_DATA_LEN + 4
-                    )
-        ));
+        let audio = parse_wav(&bytes).expect("streamed wav");
+        assert_eq!(audio.data, [1, 0, 2, 0, 3, 0, 4, 0]);
+    }
+
+    #[test]
+    fn streamed_riff_size_reads_to_end() {
+        let mut bytes = wave(1, 2, 44_100, 16);
+        bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
+        bytes.truncate(bytes.len() - 4);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[5, 0, 6, 0]);
+
+        assert_eq!(parse_wav(&bytes).expect("parse").data, [5, 0, 6, 0]);
+    }
+
+    #[test]
+    fn final_odd_chunk_without_pad_byte_is_accepted() {
+        // Mono 24-bit, one frame: a 3-byte data chunk, pad byte missing.
+        let mut bytes = wave(1, 1, 44_100, 24);
+        bytes.truncate(bytes.len() - 4);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let riff_size = u32::try_from(bytes.len() - 8).expect("fits");
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+
+        assert_eq!(parse_wav(&bytes).expect("parse").data, [1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_block_align_that_disagrees_with_layout() {
+        let mut bytes = wave(1, 2, 44_100, 16);
+        // fmt chunk starts at 20; block align sits 12 bytes in.
+        bytes[32..34].copy_from_slice(&6u16.to_le_bytes());
+        assert!(parse_wav(&bytes).is_err());
     }
 
     #[test]
