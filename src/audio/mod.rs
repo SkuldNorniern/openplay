@@ -5,6 +5,7 @@
 //! ring. The sender drains the ring one 352-frame ALAC packet at a time.
 
 pub mod alac;
+pub mod alac24;
 pub mod format;
 pub mod input;
 pub mod resample;
