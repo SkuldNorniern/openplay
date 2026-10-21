@@ -13,6 +13,8 @@ use rand::{fill, random};
 use crate::error::{Error, Result};
 use crate::rtsp::Request;
 
+const PLIST_CONTENT_TYPE: &str = "application/x-apple-binary-plist";
+
 /// Identifier used as the RTSP path for one streaming session.
 pub struct SessionId(String);
 
@@ -58,23 +60,40 @@ impl AudioStreamSecret {
 
         Self { key, iv }
     }
+
+    /// Key that encrypts the RTP audio payloads.
+    pub fn audio_key(&self) -> [u8; 32] {
+        self.key
+    }
 }
 
 /// Build the session-level SETUP request.
-pub fn session_setup_request(session: &SessionId, secret: &AudioStreamSecret) -> Result<Request> {
+///
+/// `timing_port` is our bound NTP timing port. The receiver starts sending
+/// timing requests to it right after this exchange, before stream SETUP.
+pub fn session_setup_request(
+    session: &SessionId,
+    secret: &AudioStreamSecret,
+    timing_port: u16,
+) -> Result<Request> {
     let mut body = Dictionary::new();
     body.insert("timingProtocol".into(), Value::String("NTP".into()));
+    body.insert("timingPort".into(), Value::from(timing_port));
     body.insert("ekey".into(), Value::Data(secret.key.to_vec()));
     body.insert("eiv".into(), Value::Data(secret.iv.to_vec()));
     body.insert("et".into(), Value::from(4_i64));
 
-    Ok(Request::new("SETUP", &session.path()).body(encode_plist(body)?))
+    Ok(Request::new("SETUP", &session.path())
+        .header("Content-Type", PLIST_CONTENT_TYPE)
+        .body(encode_plist(body)?))
 }
 
-/// Receiver ports established by the session-level SETUP exchange.
+/// Receiver port established by the session-level SETUP exchange.
+///
+/// A HomePod answers with `eventPort` and `skipRecord` only. It sends timing
+/// requests to our `timingPort` instead of giving one of its own.
 pub struct SessionSetupResponse {
     pub event_port: u16,
-    pub timing_port: u16,
 }
 
 /// Parse the session-level SETUP response body.
@@ -83,7 +102,6 @@ pub fn parse_session_setup_response(body: &[u8]) -> Result<SessionSetupResponse>
 
     Ok(SessionSetupResponse {
         event_port: port_field(&plist, "eventPort", "session setup")?,
-        timing_port: port_field(&plist, "timingPort", "session setup")?,
     })
 }
 
@@ -129,6 +147,7 @@ pub fn stream_setup_request(
         ports.audio, ports.control, ports.timing
     );
     Ok(Request::new("SETUP", &session.path())
+        .header("Content-Type", PLIST_CONTENT_TYPE)
         .header("Transport", transport)
         .body(encode_plist(body)?))
 }
@@ -257,7 +276,7 @@ mod tests {
         let session_key = fixed_session_key();
         let secret = AudioStreamSecret::derive(&session_key);
         let session = fixed_session();
-        let request = session_setup_request(&session, &secret).expect("build request");
+        let request = session_setup_request(&session, &secret, 5002).expect("build request");
         let body = decode_dictionary(&request.body);
 
         assert_eq!(
@@ -273,7 +292,7 @@ mod tests {
         let second = AudioStreamSecret::derive(&session_key);
         let session = fixed_session();
         let first_iv = decode_dictionary(
-            &session_setup_request(&session, &first)
+            &session_setup_request(&session, &first, 5002)
                 .expect("build request")
                 .body,
         )
@@ -282,7 +301,7 @@ mod tests {
         .expect("eiv present")
         .to_vec();
         let second_iv = decode_dictionary(
-            &session_setup_request(&session, &second)
+            &session_setup_request(&session, &second, 5002)
                 .expect("build request")
                 .body,
         )
@@ -299,7 +318,7 @@ mod tests {
     fn builds_session_setup_request() {
         let session = fixed_session();
         let secret = AudioStreamSecret::derive(&fixed_session_key());
-        let request = session_setup_request(&session, &secret).expect("build request");
+        let request = session_setup_request(&session, &secret, 5002).expect("build request");
         let body = decode_dictionary(&request.body);
 
         assert_eq!(request.method, "SETUP");
@@ -309,7 +328,8 @@ mod tests {
             Some("NTP")
         );
         assert_eq!(integer(&body, "et"), 4);
-        assert_eq!(body.len(), 4);
+        assert_eq!(integer(&body, "timingPort"), 5002);
+        assert_eq!(body.len(), 5);
     }
 
     #[test]
@@ -325,7 +345,7 @@ mod tests {
         };
 
         let session_body = decode_dictionary(
-            &session_setup_request(&session, &secret)
+            &session_setup_request(&session, &secret, 5002)
                 .expect("build session setup")
                 .body,
         );
@@ -353,21 +373,20 @@ mod tests {
 
     #[test]
     fn parses_and_validates_session_setup_ports() {
+        // Shape of a real HomePod response.
         let mut valid = Dictionary::new();
-        valid.insert("eventPort".into(), Value::from(6010_i64));
-        valid.insert("timingPort".into(), Value::from(6011_i64));
+        valid.insert("eventPort".into(), Value::from(49266_i64));
+        valid.insert("skipRecord".into(), Value::Boolean(true));
         let parsed = parse_session_setup_response(&plist_body(valid)).expect("parse session setup");
-        assert_eq!(parsed.event_port, 6010);
-        assert_eq!(parsed.timing_port, 6011);
+        assert_eq!(parsed.event_port, 49266);
 
         let mut missing = Dictionary::new();
-        missing.insert("eventPort".into(), Value::from(6010_i64));
+        missing.insert("skipRecord".into(), Value::Boolean(true));
         assert!(parse_session_setup_response(&plist_body(missing)).is_err());
 
         for invalid in [-1_i64, 70_000] {
             let mut out_of_range = Dictionary::new();
             out_of_range.insert("eventPort".into(), Value::from(invalid));
-            out_of_range.insert("timingPort".into(), Value::from(6011_i64));
             assert!(parse_session_setup_response(&plist_body(out_of_range)).is_err());
         }
     }
