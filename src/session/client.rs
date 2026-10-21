@@ -20,8 +20,9 @@ const CLIENT_NAME: &str = "openplay";
 /// A receiver that never answers is treated as failed rather than waited on.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Random per-run sender identity sent on every request.
-#[derive(Debug, Clone, Copy)]
+/// Sender identity sent on every request. Keeping it across reconnects,
+/// and across runs once stored, lets the receiver see one device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identity {
     device_id: [u8; 6],
     active_remote: u32,
@@ -29,10 +30,23 @@ pub struct Identity {
 
 impl Identity {
     pub fn generate() -> Self {
+        Self::from_device_id(random())
+    }
+
+    /// Rebuild a stored identity from its device ID.
+    pub fn from_device_id(device_id: [u8; 6]) -> Self {
+        // Active-Remote only has to be stable per device, so derive it.
+        let active_remote =
+            u32::from_be_bytes([device_id[2], device_id[3], device_id[4], device_id[5]]);
         Self {
-            device_id: random(),
-            active_remote: random(),
+            device_id,
+            active_remote,
         }
+    }
+
+    /// The 6-byte ID to store for [`Self::from_device_id`].
+    pub fn device_id(&self) -> [u8; 6] {
+        self.device_id
     }
 
     fn device_id_hex(&self) -> String {
@@ -171,6 +185,12 @@ mod tests {
         ] {
             assert!(requests[0].contains(header), "missing {header:?}");
         }
+    }
+
+    #[test]
+    fn identity_round_trips_through_device_id() {
+        let identity = Identity::generate();
+        assert_eq!(Identity::from_device_id(identity.device_id()), identity);
     }
 
     #[tokio::test]

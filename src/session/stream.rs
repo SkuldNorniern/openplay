@@ -84,10 +84,14 @@ struct Connected {
     local_ip: IpAddr,
 }
 
-async fn connect(addr: SocketAddr, bind: Option<Ipv4Addr>) -> Result<Connected> {
+async fn connect(
+    addr: SocketAddr,
+    bind: Option<Ipv4Addr>,
+    identity: Identity,
+) -> Result<Connected> {
     let stream = connect_tcp(addr, bind).await?;
     let local_ip = stream.local_addr()?.ip();
-    let mut client = RtspClient::new(stream, Identity::generate());
+    let mut client = RtspClient::new(stream, identity);
 
     let info = client.request(Request::new("GET", "/info")).await?;
     let device = DeviceInfo::from_plist(&info.body)?;
@@ -123,6 +127,7 @@ async fn connect(addr: SocketAddr, bind: Option<Ipv4Addr>) -> Result<Connected> 
 pub async fn start(
     addr: SocketAddr,
     bind: Option<Ipv4Addr>,
+    identity: Identity,
     source: AudioSource,
 ) -> Result<Streaming> {
     let Connected {
@@ -130,7 +135,7 @@ pub async fn start(
         device,
         secret,
         ..
-    } = connect(addr, bind).await?;
+    } = connect(addr, bind, identity).await?;
     let mut tasks = Tasks::new();
 
     // The receiver asks for timing as soon as session SETUP completes, so the
@@ -224,6 +229,7 @@ async fn start_realtime(
 pub async fn start_buffered(
     addr: SocketAddr,
     bind: Option<Ipv4Addr>,
+    identity: Identity,
     source: AudioSource,
 ) -> Result<Streaming> {
     let Connected {
@@ -231,7 +237,7 @@ pub async fn start_buffered(
         device,
         secret,
         local_ip,
-    } = connect(addr, bind).await?;
+    } = connect(addr, bind, identity).await?;
     let mut tasks = Tasks::new();
     let receiver_ip = addr.ip();
 

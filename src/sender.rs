@@ -18,7 +18,7 @@ use tokio::{select, spawn};
 
 use crate::audio::{AudioInput, AudioSource, PcmFormat, SourceStats};
 use crate::error::{Error, Result};
-use crate::session::{self, Streaming};
+use crate::session::{self, Identity, Streaming};
 
 /// Half a second of 44.1 kHz audio: the most the ring buffers.
 pub const DEFAULT_CAPACITY_FRAMES: usize = 22_050;
@@ -51,6 +51,9 @@ pub struct SenderConfig {
     /// Reconnect attempts after a failure before giving up; `None` retries
     /// forever, which suits a speaker that should come back on its own.
     pub max_retries: Option<u32>,
+    /// Who we are to the receiver; a fresh random identity when unset.
+    /// Store [`Identity::device_id`] to stay the same device across runs.
+    pub identity: Option<Identity>,
 }
 
 impl Default for SenderConfig {
@@ -63,6 +66,7 @@ impl Default for SenderConfig {
             capacity_frames: DEFAULT_CAPACITY_FRAMES,
             target_frames: DEFAULT_TARGET_FRAMES,
             max_retries: None,
+            identity: None,
         }
     }
 }
@@ -190,13 +194,17 @@ async fn run(
     status: watch::Sender<Status>,
     mut commands: mpsc::Receiver<Command>,
 ) {
+    // One identity for every reconnect, so the receiver sees one device.
+    let identity = config.identity.unwrap_or_else(Identity::generate);
     let mut attempt = 0_u32;
     loop {
         status.send_replace(Status::Connecting);
         let started = match config.mode {
-            StreamMode::Realtime => session::start(addr, config.bind, source.clone()).await,
+            StreamMode::Realtime => {
+                session::start(addr, config.bind, identity, source.clone()).await
+            }
             StreamMode::Buffered => {
-                session::start_buffered(addr, config.bind, source.clone()).await
+                session::start_buffered(addr, config.bind, identity, source.clone()).await
             }
         };
         let ended = match started {
