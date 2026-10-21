@@ -7,24 +7,24 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use log::{info, warn};
-use openplay::audio::{AudioInput, AudioSource, WavAudio, parse_wav};
+use log::info;
+use openplay::audio::{AudioInput, WavAudio, parse_wav};
 use openplay::cli::{self, CliError, Command};
 use openplay::device::{self, Device, DeviceKind, Features};
 use openplay::info;
+use openplay::logging;
+use openplay::sender::{Sender, SenderConfig, Status, StreamMode};
 use openplay::session::USER_AGENT;
 use openplay::{Error, Result};
-use openplay::{logging, session};
-use tokio::select;
 use tokio::signal::ctrl_c;
+use tokio::sync::watch;
 use tokio::time::sleep;
+use tokio::{select, spawn};
 
 const BROWSE_WAIT: Duration = Duration::from_secs(3);
 const AIRPLAY_PORT: u16 = 7000;
-/// Half a second of 44.1 kHz audio: the most the source buffers.
-const SOURCE_CAPACITY_FRAMES: usize = 22_050;
-/// The file is fed until about a quarter second is queued, well below
-/// capacity so nothing is dropped.
+/// The file is fed until about a quarter second is queued, well below the
+/// sender's half-second capacity so nothing is dropped.
 const FEED_TARGET_FRAMES: usize = 11_025;
 /// Chunk the file like an audio engine period.
 const FEED_PERIOD: Duration = Duration::from_millis(10);
@@ -32,7 +32,9 @@ const FEED_POLL: Duration = Duration::from_millis(4);
 /// Receiver buffers about two seconds; wait that long after the last packet
 /// before TEARDOWN so the end of the file is still heard.
 const PLAYOUT_TAIL: Duration = Duration::from_secs(2);
-const START_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// A receiver now and then rejects stream SETUP when its clock exchange
+/// has not started yet; one fresh session usually works.
+const PLAY_RETRIES: u32 = 1;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -132,48 +134,60 @@ async fn run_play(
 ) -> Result<()> {
     let audio = parse_wav(&fs::read(file)?)?;
     let addr = resolve(target, bind).await?;
-    let source = AudioSource::new(SOURCE_CAPACITY_FRAMES);
-    let input = AudioInput::new(audio.format, source.clone())?;
-
-    let start = || async {
-        if buffered {
-            session::start_buffered(addr, bind, source.clone()).await
+    let config = SenderConfig {
+        bind,
+        mode: if buffered {
+            StreamMode::Buffered
         } else {
-            session::start(addr, bind, source.clone()).await
+            StreamMode::Realtime
+        },
+        volume,
+        // The file is fed at the sender's pace, so there is no clock to follow.
+        drift_correction: false,
+        max_retries: Some(PLAY_RETRIES),
+        ..SenderConfig::default()
+    };
+    let (sender, input) = Sender::start(addr, audio.format, config)?;
+    let logger = spawn(log_status(sender.status(), file.display().to_string()));
+
+    let mut status = sender.status();
+    let outcome = select! {
+        _ = ctrl_c() => Ok(()),
+        () = feed(input, &sender, &audio) => Ok(()),
+        failed = status.wait_for(|status| matches!(status, Status::Failed { .. })) => {
+            match failed.map(|status| status.clone()) {
+                Ok(Status::Failed { error }) => Err(Error::Protocol(error)),
+                _ => Ok(()),
+            }
         }
     };
-    let mut streaming = match start().await {
-        Ok(streaming) => streaming,
-        Err(error) => {
-            // A receiver now and then rejects stream SETUP when its clock
-            // exchange has not started yet; a fresh session usually works.
-            warn!("{error}, retrying");
-            sleep(START_RETRY_DELAY).await;
-            start().await?
-        }
-    };
-    if let Some(volume) = volume {
-        streaming.set_volume(volume).await?;
-    }
-    println!(
-        "streaming {} to {} ({addr}), ctrl-c to stop",
-        file.display(),
-        streaming.device().name
-    );
-    let stop = async {
-        select! {
-            _ = ctrl_c() => {}
-            () = feed(input, &source, &audio) => {}
-        }
-    };
-    let outcome = streaming.run_until(stop).await;
-    let stats = source.stats();
+    let stats = sender.stats();
     info!(
         "underrun {} frames, overrun {} frames",
         stats.underrun_frames, stats.overrun_frames
     );
-    let teardown = streaming.teardown().await;
-    outcome.and(teardown)
+    sender.stop().await;
+    logger.abort();
+    outcome
+}
+
+/// Print status changes as they happen.
+async fn log_status(mut status: watch::Receiver<Status>, file: String) {
+    loop {
+        match status.borrow_and_update().clone() {
+            Status::Streaming { receiver } => {
+                println!("streaming {file} to {receiver}, ctrl-c to stop");
+            }
+            // The sender logs reconnects itself.
+            Status::Connecting
+            | Status::Reconnecting { .. }
+            | Status::Stopped
+            | Status::Failed { .. } => {}
+        }
+        if status.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Accept an IP address directly, otherwise find the receiver by name.
@@ -192,19 +206,19 @@ async fn resolve(target: &str, bind: Option<Ipv4Addr>) -> Result<SocketAddr> {
 
 /// Feed the file through the same conversion a live driver uses, in engine
 /// sized chunks, no faster than the sender drains them.
-async fn feed(mut input: AudioInput, source: &AudioSource, audio: &WavAudio) {
+async fn feed(mut input: AudioInput, sender: &Sender, audio: &WavAudio) {
     let period_frames =
         (u128::from(audio.format.sample_rate) * FEED_PERIOD.as_millis() / 1000) as usize;
     for chunk in audio
         .data
         .chunks(period_frames * audio.format.bytes_per_frame())
     {
-        while source.buffered_frames() >= FEED_TARGET_FRAMES {
+        while sender.buffered_frames() >= FEED_TARGET_FRAMES {
             sleep(FEED_POLL).await;
         }
         input.write(chunk);
     }
-    while source.buffered_frames() > 0 {
+    while sender.buffered_frames() > 0 {
         sleep(FEED_POLL).await;
     }
     sleep(PLAYOUT_TAIL).await;
