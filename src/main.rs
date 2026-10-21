@@ -57,7 +57,9 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Discover => run_discover(cli.bind).await,
         Command::Info { target } => run_info(&target, cli.bind).await,
-        Command::Play { target, file } => run_play(&target, &file, cli.bind, cli.volume).await,
+        Command::Play { target, file } => {
+            run_play(&target, &file, cli.bind, cli.volume, cli.buffered).await
+        }
     };
 
     match result {
@@ -126,20 +128,28 @@ async fn run_play(
     file: &Path,
     bind: Option<Ipv4Addr>,
     volume: Option<u8>,
+    buffered: bool,
 ) -> Result<()> {
     let audio = parse_wav(&fs::read(file)?)?;
     let addr = resolve(target, bind).await?;
     let source = AudioSource::new(SOURCE_CAPACITY_FRAMES);
     let input = AudioInput::new(audio.format, source.clone())?;
 
-    let mut streaming = match session::start(addr, bind, source.clone()).await {
+    let start = || async {
+        if buffered {
+            session::start_buffered(addr, bind, source.clone()).await
+        } else {
+            session::start(addr, bind, source.clone()).await
+        }
+    };
+    let mut streaming = match start().await {
         Ok(streaming) => streaming,
         Err(error) => {
             // A receiver now and then rejects stream SETUP when its clock
             // exchange has not started yet; a fresh session usually works.
             warn!("{error}, retrying");
             sleep(START_RETRY_DELAY).await;
-            session::start(addr, bind, source.clone()).await?
+            start().await?
         }
     };
     if let Some(volume) = volume {

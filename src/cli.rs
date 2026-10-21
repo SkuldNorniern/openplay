@@ -20,6 +20,8 @@ pub struct Cli {
     pub bind: Option<Ipv4Addr>,
     /// Playback volume 0 to 100; the receiver's current volume when unset.
     pub volume: Option<u8>,
+    /// Use a buffered, PTP-timed stream instead of realtime.
+    pub buffered: bool,
     pub verbose: bool,
 }
 
@@ -39,11 +41,12 @@ pub fn usage() -> &'static str {
      usage:\n\
      \x20 openplay --discover [--iface <ip>]\n\
      \x20 openplay --info <target> [--iface <ip>]\n\
-     \x20 openplay <target> <file.wav> [--iface <ip>] [--volume <0-100>]\n\
+     \x20 openplay <target> <file.wav> [--iface <ip>] [--volume <0-100>] [--buffered]\n\
      \n\
      options:\n\
      \x20 -i, --iface <ip>  bind to this local IPv4 (LAN interface)\n\
      \x20 --volume <0-100>  playback volume, 0 mutes\n\
+     \x20 --buffered        buffered stream timed by PTP (experimental)\n\
      \x20 -v, --verbose     more log detail\n\
      \x20 -h, --help        show this help\n\
      \n\
@@ -54,6 +57,7 @@ pub fn usage() -> &'static str {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     let mut bind = None;
     let mut volume = None;
+    let mut buffered = false;
     let mut verbose = false;
     let mut discover = false;
     let mut info = None;
@@ -71,6 +75,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
             "-h" | "--help" => return Err(CliError::Help),
             "-v" | "--verbose" => verbose = true,
             "--discover" => discover = true,
+            "--buffered" => buffered = true,
             "--info" => info = Some(it.next().ok_or(CliError::Usage)?),
             "-i" | "--iface" => {
                 let val = it.next().ok_or(CliError::Usage)?;
@@ -95,6 +100,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
         command,
         bind,
         volume,
+        buffered,
         verbose,
     })
 }
@@ -168,6 +174,12 @@ mod tests {
             parse(["--info", "Speaker", "--discover"].map(String::from)),
             Err(CliError::Usage)
         ));
+    }
+
+    #[test]
+    fn parses_buffered_flag() {
+        assert!(parse_ok(&["Speaker", "song.wav", "--buffered"]).buffered);
+        assert!(!parse_ok(&["Speaker", "song.wav"]).buffered);
     }
 
     #[test]
