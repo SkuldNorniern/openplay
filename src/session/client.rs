@@ -1,8 +1,11 @@
 //! RTSP request/response client for one control connection.
 
+use std::time::Duration;
+
 use log::debug;
 use rand::random;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::timeout;
 
 use crate::error::{Error, Result};
 use crate::pairing::keys::ControlKeys;
@@ -14,6 +17,8 @@ use super::ControlTransport;
 /// some behavior on the sender's AirPlay version, so this stays fixed.
 pub const USER_AGENT: &str = "AirPlay/745.83";
 const CLIENT_NAME: &str = "openplay";
+/// A receiver that never answers is treated as failed rather than waited on.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Random per-run sender identity sent on every request.
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +85,9 @@ where
         debug!("rtsp >> {method} {uri} cseq={}", self.cseq);
         self.transport.send(&request).await?;
 
-        let response = self.transport.receive().await?;
+        let response = timeout(RESPONSE_TIMEOUT, self.transport.receive())
+            .await
+            .map_err(|_| Error::Rtsp(format!("{method} {uri}: no response")))??;
         debug!(
             "rtsp << {} {} ({} byte body)",
             response.status,

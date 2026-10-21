@@ -10,7 +10,7 @@ use std::pin::pin;
 use std::result::Result as StdResult;
 use std::time::Duration;
 
-use log::info;
+use log::{info, warn};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::{MissedTickBehavior, interval};
@@ -90,7 +90,55 @@ pub async fn start(
         "session setup done, event port {}",
         session_ports.event_port
     );
-    let event_channel = EventChannel::connect(receiver_ip, session_ports.event_port, bind).await?;
+    let started = start_stream(
+        &mut client,
+        &session,
+        &secret,
+        session_ports.event_port,
+        timing_port,
+        addr,
+        bind,
+        source,
+    )
+    .await;
+    let (event_channel, audio_task) = match started {
+        Ok(started) => started,
+        Err(error) => {
+            // Leaving a half-built session behind makes the receiver ignore
+            // the next attempt for a while, so end it before reporting.
+            timing_task.abort();
+            if let Err(teardown_error) = client.request(teardown_request(&session)).await {
+                warn!("teardown after failed setup: {teardown_error}");
+            }
+            return Err(error);
+        }
+    };
+
+    Ok(Streaming {
+        client,
+        session,
+        device,
+        _event_channel: event_channel,
+        timing_task,
+        audio_task,
+    })
+}
+
+/// Everything after session SETUP: event channel, stream SETUP, RECORD and
+/// the audio task.
+#[allow(clippy::too_many_arguments)]
+async fn start_stream(
+    client: &mut RtspClient<TcpStream>,
+    session: &SessionId,
+    secret: &AudioStreamSecret,
+    event_port: u16,
+    timing_port: u16,
+    addr: SocketAddr,
+    bind: Option<Ipv4Addr>,
+    source: AudioSource,
+) -> Result<(EventChannel, JoinHandle<Result<()>>)> {
+    let receiver_ip = addr.ip();
+    let event_channel = EventChannel::connect(receiver_ip, event_port, bind).await?;
 
     let (audio_socket, audio_port) = bind_udp(receiver_ip, bind).await?;
     let (control_socket, control_port) = bind_udp(receiver_ip, bind).await?;
@@ -100,7 +148,7 @@ pub async fn start(
         timing: timing_port,
     };
     let response = client
-        .request(stream_setup_request(&session, &ports, &secret)?)
+        .request(stream_setup_request(session, &ports, secret)?)
         .await?;
     let stream_ports = parse_stream_setup_response(&response.body)?;
     info!(
@@ -120,17 +168,9 @@ pub async fn start(
     )
     .with_sync(sync);
 
-    client.request(record_request(&session)).await?;
+    client.request(record_request(session)).await?;
     let audio_task = spawn(async move { sender.run().await });
-
-    Ok(Streaming {
-        client,
-        session,
-        device,
-        _event_channel: event_channel,
-        timing_task,
-        audio_task,
-    })
+    Ok((event_channel, audio_task))
 }
 
 impl Streaming {
@@ -166,9 +206,7 @@ impl Streaming {
     pub async fn teardown(mut self) -> Result<()> {
         self.audio_task.abort();
         self.timing_task.abort();
-        self.client
-            .request(Request::new("TEARDOWN", &self.session.path()))
-            .await?;
+        self.client.request(teardown_request(&self.session)).await?;
         Ok(())
     }
 }
@@ -180,6 +218,10 @@ fn task_ended(name: &str, result: StdResult<Result<()>, JoinError>) -> Result<()
         Ok(Ok(())) => Err(Error::Protocol(format!("{name} task stopped"))),
         Err(error) => Err(Error::Protocol(format!("{name} task failed: {error}"))),
     }
+}
+
+fn teardown_request(session: &SessionId) -> Request {
+    Request::new("TEARDOWN", &session.path())
 }
 
 async fn pair(client: &mut RtspClient<TcpStream>) -> Result<Paired> {
