@@ -11,7 +11,7 @@ use tokio::time::interval;
 use crate::audio::{AlacEncoder, AudioSource, Frame};
 use crate::error::{Error, Result};
 
-use super::RtpPacketBuilder;
+use super::{RtpPacketBuilder, SyncSender};
 
 const FRAMES_PER_PACKET: usize = 352;
 const SAMPLE_RATE: f64 = 44_100.0;
@@ -31,6 +31,7 @@ pub struct RtpSender {
     /// still carry the marker, since a failed send never reached the
     /// receiver at all.
     first_packet_sent: bool,
+    sync: Option<SyncSender>,
 }
 
 impl RtpSender {
@@ -70,9 +71,17 @@ impl RtpSender {
             encoder: AlacEncoder::new(),
             packet_builder: RtpPacketBuilder::new(random(), audio_key),
             first_packet_sent: false,
+            sync: None,
         };
 
         Ok((sender, local_port))
+    }
+
+    /// Send control-channel sync packets alongside audio, as the receiver
+    /// needs them to place audio on its clock.
+    pub fn with_sync(mut self, sync: SyncSender) -> Self {
+        self.sync = Some(sync);
+        self
     }
 
     /// Pull, encode, encrypt, and transmit exactly one audio packet.
@@ -88,6 +97,10 @@ impl RtpSender {
         let alac_packet = self.encoder.encode_packet(&samples)?;
         let frame_count = alac_packet.frame_count;
         let marker = !self.first_packet_sent;
+        if let Some(sync) = &mut self.sync {
+            sync.before_audio_packet(self.packet_builder.next_timestamp())
+                .await?;
+        }
         let packet =
             self.packet_builder
                 .build_packet(&alac_packet.data, frame_count as u32, marker)?;
@@ -224,6 +237,40 @@ mod tests {
         }
 
         assert_eq!(marker_bytes, [0xe0, 0x60, 0x60]);
+    }
+
+    #[tokio::test]
+    async fn send_one_syncs_first_packet_on_control_port() {
+        let (peer, sender, _) = peer_and_sender(AudioSource::new(1)).await;
+        let control_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind control peer");
+        let (sync, _) = SyncSender::bind(
+            control_peer.local_addr().expect("control address"),
+            Some(Ipv4Addr::LOCALHOST),
+        )
+        .await
+        .expect("bind sync");
+        let mut sender = sender.with_sync(sync);
+
+        sender.send_one().await.expect("send packet");
+        sender.send_one().await.expect("send packet");
+        let sync_packet = receive_packet(&control_peer).await;
+        let _audio = receive_packet(&peer).await;
+        let second_audio = receive_packet(&peer).await;
+
+        assert_eq!(&sync_packet[..8], &[0x90, 0xd4, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sequence(&second_audio), 1);
+        let mut buffer = [0_u8; 64];
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                control_peer.recv_from(&mut buffer)
+            )
+            .await
+            .is_err(),
+            "only one sync is due in first interval"
+        );
     }
 
     #[tokio::test]

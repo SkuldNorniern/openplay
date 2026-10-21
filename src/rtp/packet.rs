@@ -46,6 +46,11 @@ impl RtpPacketBuilder {
         }
     }
 
+    /// RTP timestamp the next built packet will carry.
+    pub fn next_timestamp(&self) -> u32 {
+        self.timestamp
+    }
+
     /// Build one RTP packet carrying an ALAC payload and advance session state.
     ///
     /// `frame_count` is the actual number of audio frames represented by the
@@ -68,7 +73,12 @@ impl RtpPacketBuilder {
     /// RTP travels over lossy, unordered UDP, so each packet transmits the
     /// eight-byte counter tail needed to reconstruct its AEAD nonce. Timestamp
     /// and SSRC remain visible for routing but are authenticated as AAD.
-    pub fn build_packet(&mut self, payload: &[u8], frame_count: u32, marker: bool) -> Result<Vec<u8>> {
+    pub fn build_packet(
+        &mut self,
+        payload: &[u8],
+        frame_count: u32,
+        marker: bool,
+    ) -> Result<Vec<u8>> {
         let mut header = [0_u8; RTP_HEADER_LEN];
         header[0] = RTP_VERSION;
         header[1] = if marker {
@@ -182,7 +192,9 @@ mod tests {
         // the caller's decision (see build_packet's doc comment for why) --
         // this builder only needs to write whatever it's told correctly.
         let mut builder = RtpPacketBuilder::new(SSRC, KEY);
-        let marked = builder.build_packet(b"first", 100, true).expect("build marked");
+        let marked = builder
+            .build_packet(b"first", 100, true)
+            .expect("build marked");
         let unmarked = builder
             .build_packet(b"second", 100, false)
             .expect("build unmarked");
