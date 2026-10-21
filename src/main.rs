@@ -181,7 +181,7 @@ async fn run_play(
         fed = feed_input(input, &sender, feed) => fed,
         failed = status.wait_for(|status| matches!(status, Status::Failed { .. })) => {
             match failed.map(|status| status.clone()) {
-                Ok(Status::Failed { error }) => Err(Error::Protocol(error)),
+                Ok(Status::Failed { error }) => Err(Error::Session(error)),
                 _ => Ok(()),
             }
         }
