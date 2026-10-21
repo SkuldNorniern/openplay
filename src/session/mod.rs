@@ -7,7 +7,7 @@ pub mod setup;
 pub mod stream;
 pub mod transport;
 
-pub use client::{Identity, RtspClient};
+pub use client::{Identity, RtspClient, USER_AGENT};
 pub use event_channel::EventChannel;
 pub use setup::{
     AudioStreamSecret, LocalStreamPorts, SessionId, SessionSetupResponse, StreamSetupResponse,

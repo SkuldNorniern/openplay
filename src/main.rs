@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use openplay::audio::{AudioSource, Frame, PcmSamples, parse_wav};
 use openplay::cli::{self, CliError, Command};
-use openplay::discovery::{self, SERVICE_AIRPLAY, SERVICE_RAOP};
+use openplay::device::{self, Device, DeviceKind, Features};
+use openplay::info;
+use openplay::session::USER_AGENT;
 use openplay::{Error, Result};
 use openplay::{logging, session};
 use tokio::select;
@@ -48,6 +50,7 @@ async fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Discover => run_discover(cli.bind).await,
+        Command::Info { target } => run_info(&target, cli.bind).await,
         Command::Play { target, file } => run_play(&target, &file, cli.bind).await,
     };
 
@@ -61,20 +64,54 @@ async fn main() -> ExitCode {
 }
 
 async fn run_discover(bind: Option<Ipv4Addr>) -> Result<()> {
-    let found = discovery::browse(&[SERVICE_AIRPLAY, SERVICE_RAOP], bind, BROWSE_WAIT).await?;
-    if found.is_empty() {
+    let devices = device::scan(bind, BROWSE_WAIT).await?;
+    if devices.is_empty() {
         println!("no receivers found");
         return Ok(());
     }
-    for r in found {
-        let model = r.txt.get("model").map(String::as_str).unwrap_or("?");
-        let addr = r
-            .addrs
-            .first()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| r.host.clone());
-        println!("{:<24} {}:{}  [{}]", r.instance, addr, r.port, model);
+    for device in devices {
+        println!("{}", describe(&device));
     }
+    Ok(())
+}
+
+fn describe(device: &Device) -> String {
+    let model = device.model.as_deref().unwrap_or("?");
+    let version = device.airplay_version.as_deref().unwrap_or("?");
+    let pairing = if device.can_stream_without_pin() {
+        "no pin"
+    } else {
+        "needs pin"
+    };
+    format!(
+        "{:<20} {:<21} {} ({model}) airplay {version}, {pairing} [{}]",
+        device.name,
+        device.addr.to_string(),
+        device.kind,
+        device.features.names().join(", ")
+    )
+}
+
+async fn run_info(target: &str, bind: Option<Ipv4Addr>) -> Result<()> {
+    let addr = resolve(target, bind).await?;
+    let info = info::fetch(addr, bind, USER_AGENT).await?;
+    let features = Features::from_bits(info.features);
+
+    println!("name      {}", info.name);
+    println!("address   {addr}");
+    println!(
+        "model     {} ({})",
+        info.model,
+        DeviceKind::from_model(&info.model)
+    );
+    println!("airplay   {}", info.source_version);
+    println!("device id {}", info.device_id);
+    println!(
+        "features  {:#018x} [{}]",
+        info.features,
+        features.names().join(", ")
+    );
+    println!("status    {:#x}", info.status_flags);
     Ok(())
 }
 
@@ -106,19 +143,12 @@ async fn resolve(target: &str, bind: Option<Ipv4Addr>) -> Result<SocketAddr> {
         return Ok(SocketAddr::new(ip, AIRPLAY_PORT));
     }
 
-    let found = discovery::browse(&[SERVICE_AIRPLAY], bind, BROWSE_WAIT).await?;
-    let record = found
+    device::scan(bind, BROWSE_WAIT)
+        .await?
         .into_iter()
-        .find(|record| record.instance.eq_ignore_ascii_case(target))
-        .ok_or_else(|| Error::Discovery(format!("no receiver named {target}")))?;
-    let ip = record
-        .addrs
-        .iter()
-        .find(|addr| addr.is_ipv4())
-        .or(record.addrs.first())
-        .copied()
-        .ok_or_else(|| Error::Discovery(format!("{target} has no address")))?;
-    Ok(SocketAddr::new(ip, record.port))
+        .find(|device| device.name.eq_ignore_ascii_case(target))
+        .map(|device| device.addr)
+        .ok_or_else(|| Error::Discovery(format!("no receiver named {target}")))
 }
 
 /// Queue the file in packet-sized chunks no faster than the sender drains

@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub enum Command {
     /// List AirPlay receivers on the network.
     Discover,
+    /// Show one receiver's details from its `/info`.
+    Info { target: String },
     /// Stream a WAV file to a receiver (name or IP).
     Play { target: String, file: PathBuf },
 }
@@ -34,6 +36,7 @@ pub fn usage() -> &'static str {
      \n\
      usage:\n\
      \x20 openplay --discover [--iface <ip>]\n\
+     \x20 openplay --info <target> [--iface <ip>]\n\
      \x20 openplay <target> <file.wav> [--iface <ip>]\n\
      \n\
      options:\n\
@@ -49,6 +52,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     let mut bind = None;
     let mut verbose = false;
     let mut discover = false;
+    let mut info = None;
     let mut positionals: Vec<String> = Vec::new();
     let mut opts_done = false;
 
@@ -63,6 +67,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
             "-h" | "--help" => return Err(CliError::Help),
             "-v" | "--verbose" => verbose = true,
             "--discover" => discover = true,
+            "--info" => info = Some(it.next().ok_or(CliError::Usage)?),
             "-i" | "--iface" => {
                 let val = it.next().ok_or(CliError::Usage)?;
                 let ip = val.parse::<Ipv4Addr>().map_err(|_| CliError::Usage)?;
@@ -73,7 +78,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
         }
     }
 
-    let command = build_command(discover, positionals)?;
+    let command = build_command(discover, info, positionals)?;
     Ok(Cli {
         command,
         bind,
@@ -81,7 +86,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     })
 }
 
-fn build_command(discover: bool, positionals: Vec<String>) -> Result<Command, CliError> {
+fn build_command(
+    discover: bool,
+    info: Option<String>,
+    positionals: Vec<String>,
+) -> Result<Command, CliError> {
+    if let Some(target) = info {
+        if discover || !positionals.is_empty() {
+            return Err(CliError::Usage);
+        }
+        return Ok(Command::Info { target });
+    }
     if discover {
         if !positionals.is_empty() {
             return Err(CliError::Usage);
@@ -121,8 +136,25 @@ mod tests {
                 assert_eq!(target, "Speaker");
                 assert_eq!(file, PathBuf::from("song.wav"));
             }
-            Command::Discover => panic!("expected play"),
+            _ => panic!("expected play"),
         }
+    }
+
+    #[test]
+    fn parses_info_target() {
+        let cli = parse_ok(&["--info", "Speaker", "-i", "192.0.2.10"]);
+        match cli.command {
+            Command::Info { target } => assert_eq!(target, "Speaker"),
+            _ => panic!("expected info"),
+        }
+        assert!(matches!(
+            parse(["--info"].map(String::from)),
+            Err(CliError::Usage)
+        ));
+        assert!(matches!(
+            parse(["--info", "Speaker", "--discover"].map(String::from)),
+            Err(CliError::Usage)
+        ));
     }
 
     #[test]
@@ -154,7 +186,7 @@ mod tests {
         let cli = parse_ok(&["--", "-Speaker", "song.wav"]);
         match cli.command {
             Command::Play { target, .. } => assert_eq!(target, "-Speaker"),
-            Command::Discover => panic!("expected play"),
+            _ => panic!("expected play"),
         }
     }
 }

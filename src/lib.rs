@@ -9,6 +9,7 @@
 pub mod audio;
 pub mod cli;
 pub mod crypto;
+pub mod device;
 pub mod discovery;
 pub mod error;
 pub mod info;
