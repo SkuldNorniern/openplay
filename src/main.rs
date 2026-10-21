@@ -218,18 +218,25 @@ async fn feed_stdin(mut input: AudioInput, sender: &Sender, format: PcmFormat) -
         }
         input.write(&buffer[..read]);
     }
-    drain(sender).await;
+    drain(sender, false).await;
     Ok(())
 }
 
-/// Wait for queued audio to go out and play. Nothing drains the queue
-/// without a session, so give up on it once the stream is down.
-async fn drain(sender: &Sender) {
-    let streaming = || matches!(*sender.status().borrow(), Status::Streaming { .. });
-    while sender.buffered_frames() > 0 && streaming() {
+/// Wait for queued audio to go out and play.
+///
+/// Nothing drains the queue without a session. A file waits out reconnects,
+/// which end in `Failed` since its retries are capped; live input that ends
+/// while disconnected is dropped, as retries there never give up.
+async fn drain(sender: &Sender, wait_for_session: bool) {
+    let waiting = || match *sender.status().borrow() {
+        Status::Streaming { .. } => true,
+        Status::Connecting | Status::Reconnecting { .. } => wait_for_session,
+        Status::Stopped | Status::Failed { .. } => false,
+    };
+    while sender.buffered_frames() > 0 && waiting() {
         sleep(FEED_POLL).await;
     }
-    if streaming() {
+    if matches!(*sender.status().borrow(), Status::Streaming { .. }) {
         sleep(PLAYOUT_TAIL).await;
     }
 }
@@ -281,5 +288,5 @@ async fn feed_file(mut input: AudioInput, sender: &Sender, audio: &WavAudio) {
         }
         input.write(chunk);
     }
-    drain(sender).await;
+    drain(sender, true).await;
 }
