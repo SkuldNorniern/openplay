@@ -10,6 +10,8 @@ pub mod tlv;
 
 pub use tlv::{Tlv, TlvType};
 
+use std::fmt;
+
 use crate::error::{Error, Result};
 use srp::{SrpClient, TRANSIENT_PASSWORD, USERNAME};
 
@@ -24,6 +26,20 @@ pub struct AwaitM2 {
 /// Pair-setup state waiting for the receiver's M4 proof.
 pub struct AwaitM4 {
     srp: SrpClient,
+}
+
+/// Everything a finished pair-setup yields.
+pub struct Paired {
+    /// Keys for the encrypted RTSP control channel.
+    pub control_keys: keys::ControlKeys,
+    /// Raw SRP session key; the audio stream secret is taken from it.
+    pub session_key: Vec<u8>,
+}
+
+impl fmt::Debug for Paired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Paired(..)")
+    }
 }
 
 /// Sans-IO transient pair-setup driver.
@@ -93,12 +109,16 @@ impl PairSetup<AwaitM2> {
 
 impl PairSetup<AwaitM4> {
     /// Consume and authenticate M4, then derive the control-channel keys.
-    pub fn process_m4(self, m4: &Tlv) -> Result<keys::ControlKeys> {
+    pub fn process_m4(self, m4: &Tlv) -> Result<Paired> {
         validate_response(m4, 4, "M4")?;
         let server_proof = required_field(m4, TlvType::Proof, "M4 Proof")?;
         let session_key = self.state.srp.verify_server(server_proof)?;
+        let control_keys = keys::derive_control_keys(&session_key)?;
 
-        keys::derive_control_keys(&session_key)
+        Ok(Paired {
+            control_keys,
+            session_key,
+        })
     }
 }
 
@@ -154,7 +174,8 @@ mod tests {
     fn receiver_challenge() -> (Server<G3072, Sha512>, Vec<u8>, Vec<u8>) {
         let registration = Client::<G3072, Sha512>::new();
         let password_verifier = registration.compute_verifier(USERNAME, TRANSIENT_PASSWORD, SALT);
-        let server = Server::<G3072, Sha512>::new();
+        // g_no_pad: the HomeKit proof form a real receiver checks.
+        let server = Server::<G3072, Sha512>::new_with_options(true);
         let server_public = server.compute_public_ephemeral(SERVER_SECRET, &password_verifier);
 
         (server, password_verifier, server_public)
@@ -201,15 +222,17 @@ mod tests {
                 client_public,
             )
             .expect("server processes M3 public value");
-        server_verifier
+        let server_key = server_verifier
             .verify_client(client_proof)
-            .expect("server verifies M3 proof");
+            .expect("server verifies M3 proof")
+            .to_vec();
         let m4 = Tlv::new()
             .put_u8(TlvType::State, 4)
             .put(TlvType::Proof, server_verifier.proof());
 
-        let keys = driver.process_m4(&m4).expect("process M4");
-        assert_ne!(keys.write, keys.read);
+        let paired = driver.process_m4(&m4).expect("process M4");
+        assert_ne!(paired.control_keys.write, paired.control_keys.read);
+        assert_eq!(paired.session_key, server_key);
     }
 
     #[test]

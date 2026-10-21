@@ -5,8 +5,9 @@
 //! across M2 through M4 and exposes only the values needed by the pairing flow.
 
 use rand::fill;
-use sha2::Sha512;
-use srp::{AuthError, Client, ClientVerifier, bigint::BoxedUint, groups::G3072};
+use sha2::{Digest, Sha512};
+use srp::utils::{compute_m1_rfc5054, compute_m2};
+use srp::{AuthError, Client, Group, bigint::BoxedUint, groups::G3072};
 
 use crate::error::{Error, Result};
 
@@ -28,11 +29,22 @@ const MAX_SERVER_PUBLIC_LEN: usize = 384;
 /// unboundedly on the way into the identity hash.
 const MAX_SALT_LEN: usize = 256;
 
+/// Proof expected in M4 and the key it unlocks, kept between M3 and M4.
+struct Handshake {
+    server_proof: Vec<u8>,
+    session_key: Vec<u8>,
+}
+
 /// Stateful SRP-6a client for one pair-setup exchange.
+///
+/// The `srp` crate supplies the group math and the shared secret, but its
+/// client proof hashes a padded generator. HomeKit hashes `g` unpadded in
+/// `M1 = H(H(N) xor H(g) | H(I) | s | A | B | K)`, and a receiver rejects the
+/// padded form with error 2, so both proofs are computed here instead.
 pub struct SrpClient {
     client: Client<G3072, Sha512>,
     secret: [u8; 32],
-    verifier: Option<ClientVerifier<Sha512>>,
+    handshake: Option<Handshake>,
 }
 
 impl SrpClient {
@@ -41,7 +53,7 @@ impl SrpClient {
         Self {
             client: Client::new(),
             secret: fresh_secret(),
-            verifier: None,
+            handshake: None,
         }
     }
 
@@ -60,7 +72,7 @@ impl SrpClient {
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         // A failed replacement challenge must not leave an earlier exchange
         // available for M4 verification.
-        self.verifier = None;
+        self.handshake = None;
 
         if server_public.is_empty() || server_public.len() > MAX_SERVER_PUBLIC_LEN {
             return Err(Error::Pairing(format!(
@@ -86,23 +98,36 @@ impl SrpClient {
             .client
             .process_reply(&self.secret, username, password, salt, server_public)
             .map_err(pairing_error)?;
-        let client_proof = verifier.proof().to_vec();
-        self.verifier = Some(verifier);
+        let session_key = Sha512::digest(verifier.key());
+        let client_proof = compute_m1_rfc5054::<Sha512>(
+            &G3072::generator(),
+            true,
+            username,
+            salt,
+            &client_public,
+            server_public,
+            &session_key,
+        );
+        let server_proof = compute_m2::<Sha512>(&client_public, &client_proof, &session_key);
+        self.handshake = Some(Handshake {
+            server_proof: server_proof.to_vec(),
+            session_key: session_key.to_vec(),
+        });
 
-        Ok((client_public, client_proof))
+        Ok((client_public, client_proof.to_vec()))
     }
 
     /// Authenticate M4 and return the SRP session key used as HKDF input.
     pub fn verify_server(&self, server_proof: &[u8]) -> Result<Vec<u8>> {
-        let verifier = self
-            .verifier
+        let handshake = self
+            .handshake
             .as_ref()
             .ok_or_else(|| Error::Pairing("srp: no challenge has been processed".into()))?;
 
-        verifier
-            .verify_server(server_proof)
-            .map(Vec::from)
-            .map_err(pairing_error)
+        if !constant_time_eq(&handshake.server_proof, server_proof) {
+            return Err(pairing_error(AuthError::BadRecordMac { peer: "server" }));
+        }
+        Ok(handshake.session_key.clone())
     }
 }
 
@@ -114,6 +139,19 @@ impl Default for SrpClient {
 
 fn pairing_error(error: AuthError) -> Error {
     Error::Pairing(format!("srp: {error}"))
+}
+
+/// Compare without an early exit, so timing does not reveal how much of a
+/// forged proof matched.
+fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
 }
 
 fn fresh_secret() -> [u8; 32] {
@@ -133,7 +171,8 @@ mod tests {
     fn receiver_challenge() -> (Server<G3072, Sha512>, Vec<u8>, Vec<u8>) {
         let registration = Client::<G3072, Sha512>::new();
         let password_verifier = registration.compute_verifier(USERNAME, TRANSIENT_PASSWORD, SALT);
-        let server = Server::<G3072, Sha512>::new();
+        // g_no_pad: the HomeKit proof form a real receiver checks.
+        let server = Server::<G3072, Sha512>::new_with_options(true);
         let server_public = server.compute_public_ephemeral(SERVER_SECRET, &password_verifier);
 
         (server, password_verifier, server_public)
