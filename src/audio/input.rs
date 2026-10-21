@@ -5,6 +5,36 @@ use super::resample::Resampler;
 use super::source::{AudioSource, WriteOutcome};
 use crate::error::Result;
 
+/// Largest drift correction, in parts per million. 1000 ppm is a pitch
+/// change of about 1.7 cents, below what listeners notice, and well above
+/// the 10 to 100 ppm two crystal clocks usually differ by.
+const MAX_ADJUSTMENT_PPM: f64 = 1_000.0;
+/// Correction per unit of relative fill error: 10% over target asks for the
+/// full 1000 ppm, and a 100 ppm drift settles 1% off target. The loop's time
+/// constant is about 25 s at a quarter-second target, slow enough that the
+/// 352-frame steps of the sender's reads cause no audible wobble.
+const ADJUSTMENT_GAIN_PPM: f64 = 10_000.0;
+/// Weight of each write in the smoothed fill level. With 10 ms engine
+/// periods this averages over about a second, hiding the 352-frame steps
+/// of the sender's reads.
+const FILL_SMOOTHING: f64 = 0.01;
+
+/// Keeps the ring near a target fill by nudging the resampler, so a source
+/// clock that runs slightly fast or slow against the sender never drains
+/// or floods the ring.
+struct DriftControl {
+    target_frames: f64,
+    smoothed_frames: f64,
+}
+
+impl DriftControl {
+    fn adjustment_ppm(&mut self, buffered_frames: usize) -> i32 {
+        self.smoothed_frames += FILL_SMOOTHING * (buffered_frames as f64 - self.smoothed_frames);
+        let error = (self.smoothed_frames - self.target_frames) / self.target_frames;
+        (error * ADJUSTMENT_GAIN_PPM).clamp(-MAX_ADJUSTMENT_PPM, MAX_ADJUSTMENT_PPM) as i32
+    }
+}
+
 /// Writer side of a stream: takes PCM in the source's own format, in any
 /// chunk size, and feeds 44.1 kHz/16-bit stereo into an [`AudioSource`].
 ///
@@ -15,6 +45,7 @@ pub struct AudioInput {
     format: PcmFormat,
     source: AudioSource,
     resampler: Option<Resampler>,
+    drift: Option<DriftControl>,
     /// Bytes of an incomplete frame left over from the previous write.
     partial: Vec<u8>,
     decoded: Vec<StereoFrame>,
@@ -31,11 +62,26 @@ impl AudioInput {
             source,
             resampler: (format.sample_rate != output_rate)
                 .then(|| Resampler::new(format.sample_rate, output_rate)),
+            drift: None,
             partial: Vec::with_capacity(format.bytes_per_frame()),
             decoded: Vec::new(),
             resampled: Vec::new(),
             samples: Vec::new(),
         })
+    }
+
+    /// Follow a live source's clock: keep about `target_frames` buffered by
+    /// adjusting the conversion rate slightly. Not for files, which are fed
+    /// at the sender's pace anyway.
+    pub fn with_drift_correction(mut self, target_frames: usize) -> Self {
+        let output_rate = PcmFormat::AIRPLAY.sample_rate;
+        self.resampler
+            .get_or_insert_with(|| Resampler::new(self.format.sample_rate, output_rate));
+        self.drift = Some(DriftControl {
+            target_frames: target_frames.max(1) as f64,
+            smoothed_frames: target_frames as f64,
+        });
+        self
     }
 
     pub fn format(&self) -> PcmFormat {
@@ -63,6 +109,9 @@ impl AudioInput {
         decode_stereo(self.format, &rest[..whole], &mut self.decoded);
         self.partial.extend_from_slice(&rest[whole..]);
 
+        if let (Some(drift), Some(resampler)) = (&mut self.drift, &mut self.resampler) {
+            resampler.set_adjustment_ppm(drift.adjustment_ppm(self.source.buffered_frames()));
+        }
         let frames = match &mut self.resampler {
             Some(resampler) => {
                 self.resampled.clear();
@@ -135,6 +184,55 @@ mod tests {
 
         let samples = source.read(buffered);
         assert!(samples[200..].chunks(2).all(|f| f == [8_192, -8_192]));
+    }
+
+    /// Two minutes of a source clock running about 208 ppm fast: 48010
+    /// frames a second in 10 ms periods, while the sender takes 441 frames a
+    /// period.
+    fn run_fast_source(input: &mut AudioInput, source: &AudioSource) {
+        let silence = vec![0_u8; 482 * 8];
+        for period in 0..12_000_usize {
+            let frames = if period % 10 == 0 { 481 } else { 480 };
+            input.write(&silence[..frames * 8]);
+            source.read(441);
+        }
+    }
+
+    fn float_48k() -> PcmFormat {
+        PcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample: SampleFormat::F32,
+        }
+    }
+
+    #[test]
+    fn drift_correction_holds_fill_near_target() {
+        let source = AudioSource::new(22_050);
+        source.write(&vec![0; 11_025 * 2]);
+        let mut input = AudioInput::new(float_48k(), source.clone())
+            .expect("input")
+            .with_drift_correction(11_025);
+
+        run_fast_source(&mut input, &source);
+
+        let fill = source.buffered_frames();
+        assert!((11_025..=11_800).contains(&fill), "fill {fill}");
+        assert_eq!(source.stats().overrun_frames, 0);
+        assert_eq!(source.stats().underrun_frames, 0);
+    }
+
+    #[test]
+    fn without_correction_fast_source_keeps_growing() {
+        let source = AudioSource::new(22_050);
+        source.write(&vec![0; 11_025 * 2]);
+        let mut input = AudioInput::new(float_48k(), source.clone()).expect("input");
+
+        run_fast_source(&mut input, &source);
+
+        // About 1100 frames gained in two minutes, and still climbing.
+        let fill = source.buffered_frames();
+        assert!(fill > 12_000, "fill {fill}");
     }
 
     #[test]

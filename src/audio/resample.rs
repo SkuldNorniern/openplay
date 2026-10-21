@@ -15,24 +15,33 @@ use super::format::StereoFrame;
 const LOOKBEHIND: usize = 1;
 /// Frames needed after the read position's integer part.
 const LOOKAHEAD: usize = 2;
+/// Fixed-point bits in the read position's fraction.
+const FRACTION_BITS: u32 = 32;
+const FRACTION_MASK: u64 = (1 << FRACTION_BITS) - 1;
+const PPM: i64 = 1_000_000;
 
 pub struct Resampler {
-    input_rate: u64,
-    output_rate: u64,
+    /// Input frames per output frame at the nominal rates, in 32.32 fixed
+    /// point.
+    nominal_step: u64,
+    /// `nominal_step` with the current drift adjustment applied.
+    step: u64,
     /// Integer part of the read position, an index into `history`.
     index: usize,
-    /// Fractional part of the read position, in units of 1/`output_rate`
-    /// input frames. Integer bookkeeping keeps the position exact, so chunk
-    /// boundaries cannot shift it by rounding.
+    /// Fractional part of the read position, in 1/2^32 input frames.
+    /// Integer bookkeeping keeps the position exact, so chunk boundaries
+    /// cannot shift it by rounding.
     phase: u64,
     history: Vec<StereoFrame>,
 }
 
 impl Resampler {
     pub fn new(input_rate: u32, output_rate: u32) -> Self {
+        let (input_rate, output_rate) = (u64::from(input_rate), u64::from(output_rate));
+        let nominal_step = ((input_rate << FRACTION_BITS) + output_rate / 2) / output_rate;
         Self {
-            input_rate: u64::from(input_rate),
-            output_rate: u64::from(output_rate),
+            nominal_step,
+            step: nominal_step,
             // One silent frame before the first real one lets interpolation
             // start at the first input frame instead of skipping it.
             index: LOOKBEHIND,
@@ -41,12 +50,21 @@ impl Resampler {
         }
     }
 
+    /// Consume input `ppm` parts per million faster than nominal (slower
+    /// when negative), producing correspondingly fewer output frames. Used
+    /// to follow a source clock that drifts against the sender's.
+    pub fn set_adjustment_ppm(&mut self, ppm: i32) {
+        let scaled =
+            i128::from(self.nominal_step) * i128::from(PPM + i64::from(ppm)) / i128::from(PPM);
+        self.step = u64::try_from(scaled.max(1)).unwrap_or(self.nominal_step);
+    }
+
     /// Resample `input` and append the result to `out`.
     pub fn process(&mut self, input: &[StereoFrame], out: &mut Vec<StereoFrame>) {
         self.history.extend_from_slice(input);
 
         while self.index + LOOKAHEAD < self.history.len() {
-            let fraction = (self.phase as f64 / self.output_rate as f64) as f32;
+            let fraction = (self.phase as f64 / (1_u64 << FRACTION_BITS) as f64) as f32;
             let [p0, p1, p2, p3] = [
                 self.history[self.index - 1],
                 self.history[self.index],
@@ -57,9 +75,9 @@ impl Resampler {
                 catmull_rom(p0[0], p1[0], p2[0], p3[0], fraction),
                 catmull_rom(p0[1], p1[1], p2[1], p3[1], fraction),
             ]);
-            self.phase += self.input_rate;
-            self.index += (self.phase / self.output_rate) as usize;
-            self.phase %= self.output_rate;
+            self.phase += self.step;
+            self.index += (self.phase >> FRACTION_BITS) as usize;
+            self.phase &= FRACTION_MASK;
         }
 
         // Drop frames no future output can reach, keeping the lookbehind.
@@ -126,6 +144,23 @@ mod tests {
             .map(|(got, want)| (got[0] - want[0]).abs())
             .fold(0.0_f32, f32::max);
         assert!(worst < 2e-3, "max error {worst}");
+    }
+
+    #[test]
+    fn adjustment_changes_output_count_by_ppm() {
+        let input = vec![[0.0; 2]; 441_000];
+        let count = |ppm| {
+            let mut resampler = Resampler::new(44_100, 44_100);
+            resampler.set_adjustment_ppm(ppm);
+            let mut out = Vec::new();
+            resampler.process(&input, &mut out);
+            out.len() as i64
+        };
+        let nominal = count(0);
+
+        // 1000 ppm faster consumption leaves about 441 fewer of 441000.
+        assert!((count(1_000) - (nominal - 441)).abs() <= 1);
+        assert!((count(-1_000) - (nominal + 441)).abs() <= 1);
     }
 
     #[test]
