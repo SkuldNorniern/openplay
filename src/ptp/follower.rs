@@ -105,6 +105,9 @@ struct PendingSync {
     sequence_id: u16,
     received: i128,
     origin: Option<i128>,
+    /// A two-step Sync's own correction, which applies on top of its
+    /// Follow_Up's.
+    correction: i128,
 }
 
 struct PendingDelayReq {
@@ -168,6 +171,7 @@ impl Follower {
                     sequence_id: message.header.sequence_id,
                     received,
                     origin: (!two_step).then(|| nanos(origin) + correction),
+                    correction,
                 });
                 if two_step {
                     Action::None
@@ -177,7 +181,7 @@ impl Follower {
             }
             Body::FollowUp { precise_origin } => match &mut self.sync {
                 Some(sync) if sync.sequence_id == message.header.sequence_id => {
-                    sync.origin = Some(nanos(precise_origin) + correction);
+                    sync.origin = Some(nanos(precise_origin) + sync.correction + correction);
                     self.start_delay_req()
                 }
                 _ => Action::None,
@@ -363,6 +367,42 @@ mod tests {
             Action::None
         );
         assert_eq!(follower.leader(), Some(LEADER.clock_identity));
+    }
+
+    #[test]
+    fn two_step_sync_correction_is_applied() {
+        // A switch adds 500 us of residence time and records it in the
+        // Sync's correction field; the path is otherwise symmetric with
+        // 100 us each way and no clock offset.
+        let residence: i128 = 500_000;
+        let delay: i128 = 100_000;
+        let mut follower = Follower::new(ME, 0);
+        for sequence in 0..MIN_SAMPLES as u16 {
+            let t1 = i128::from(sequence) * SECOND + SECOND;
+            let mut sync = encode_sync(LEADER, 0, sequence, stamp(0));
+            sync[8..16].copy_from_slice(&((residence as i64) << 16).to_be_bytes());
+            let t2 = t1 + delay + residence;
+            follower.on_message(&decode(&sync), t2);
+            let Action::SendDelayReq { sequence_id, .. } = follower.on_message(
+                &decode(&encode_follow_up(LEADER, 0, sequence, stamp(t1))),
+                t2,
+            ) else {
+                panic!("follow up should ask for a delay request");
+            };
+            let t3 = t2 + 1_000_000;
+            follower.delay_req_sent(sequence_id, t3);
+            follower.on_message(
+                &decode(&encode_delay_resp(
+                    LEADER,
+                    0,
+                    sequence_id,
+                    stamp(t3 + delay),
+                    ME,
+                )),
+                t3 + 2 * delay,
+            );
+        }
+        assert_eq!(follower.clock().offset_nanos(), Some(0));
     }
 
     #[test]
