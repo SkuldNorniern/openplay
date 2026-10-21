@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod error;
 pub mod info;
+pub mod logging;
 pub mod pairing;
 pub mod rtp;
 pub mod rtsp;

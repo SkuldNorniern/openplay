@@ -14,11 +14,12 @@ categories = ["multimedia::audio", "network-programming"]
 alac-encoder = "0.3.0"
 chacha20poly1305 = "0.11.0"
 hkdf = "0.13.0"
+log = "0.4"
 plist = "1"
 rand = "0.10.2"
 sha2 = "0.11.0"
 srp = "0.7.0-rc.1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "signal"] }
 
 [lints.clippy]
 absolute_paths = "deny"
