@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod capture;
 pub mod cli;
 pub mod crypto;
 pub mod device;

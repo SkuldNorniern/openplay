@@ -26,6 +26,8 @@ pub enum Error {
     Crypto(String),
     /// A protocol invariant was violated by the peer or by us.
     Protocol(String),
+    /// Audio capture or device access failed.
+    Audio(String),
     /// A background session ended; the message is the underlying error,
     /// already formatted with its own category.
     Session(String),
@@ -40,6 +42,7 @@ impl fmt::Display for Error {
             Error::Pairing(m) => write!(f, "pairing: {m}"),
             Error::Crypto(m) => write!(f, "crypto: {m}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
+            Error::Audio(m) => write!(f, "audio: {m}"),
             Error::Session(m) => f.write_str(m),
         }
     }
