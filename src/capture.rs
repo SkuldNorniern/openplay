@@ -32,7 +32,7 @@ mod windows {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use log::{debug, warn};
+    use log::{info, warn};
     use wasapi::{
         AudioClient, Device, DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat,
         initialize_mta,
@@ -48,6 +48,8 @@ mod windows {
     /// Shared-mode buffer: 100 ms, in 100 ns units. Loose enough that a
     /// late wake-up never loses audio.
     const BUFFER_DURATION_HNS: i64 = 1_000_000;
+    /// Polls between checks for a new default output: about a second.
+    const DEFAULT_CHECK_POLLS: u32 = 333;
 
     fn audio_error(error: impl Display) -> Error {
         Error::Audio(error.to_string())
@@ -128,7 +130,7 @@ mod windows {
                 .name("openplay-loopback".to_owned())
                 .spawn(move || {
                     let opened = open(wanted.as_deref());
-                    let (client, name) = match opened {
+                    let (mut client, mut device_id, name) = match opened {
                         Ok(opened) => opened,
                         Err(error) => {
                             let message = error.to_string();
@@ -137,7 +139,23 @@ mod windows {
                         }
                     };
                     let _ = ready_sender.send(Ok(name));
-                    capture_loop(&client, &mut input, &thread_stop)
+                    // With no device named, follow the Windows default output
+                    // when the user switches it, as speakers would.
+                    let follow_default = wanted.is_none();
+                    loop {
+                        match capture_loop(
+                            &client,
+                            &device_id,
+                            follow_default,
+                            &mut input,
+                            &thread_stop,
+                        )? {
+                            Ended::Stopped => return Ok(()),
+                            Ended::DefaultChanged => {
+                                (client, device_id, _) = open(None)?;
+                            }
+                        }
+                    }
                 })
                 .map_err(Error::from)?;
 
@@ -180,11 +198,13 @@ mod windows {
         }
     }
 
-    fn open(device: Option<&str>) -> Result<(AudioClient, String)> {
+    /// Open loopback on a device; returns its client, endpoint ID and name.
+    fn open(device: Option<&str>) -> Result<(AudioClient, String, String)> {
         let _ = initialize_mta();
         let enumerator = DeviceEnumerator::new().map_err(audio_error)?;
         let device = find_device(&enumerator, device)?;
         let name = device.get_friendlyname().map_err(audio_error)?;
+        let id = device.get_id().map_err(audio_error)?;
         let mut client = device.get_iaudioclient().map_err(audio_error)?;
         let format = WaveFormat::new(
             32,
@@ -205,17 +225,47 @@ mod windows {
                 },
             )
             .map_err(audio_error)?;
-        debug!("loopback capturing {name}");
-        Ok((client, name))
+        info!("loopback capturing {name}");
+        Ok((client, id, name))
     }
 
-    fn capture_loop(client: &AudioClient, input: &mut AudioInput, stop: &AtomicBool) -> Result<()> {
+    enum Ended {
+        Stopped,
+        DefaultChanged,
+    }
+
+    /// Whether the default output is no longer the device with `id`.
+    fn default_changed(id: &str) -> bool {
+        DeviceEnumerator::new()
+            .and_then(|enumerator| enumerator.get_default_device(&Direction::Render))
+            .and_then(|device| device.get_id())
+            .is_ok_and(|current| current != id)
+    }
+
+    fn capture_loop(
+        client: &AudioClient,
+        device_id: &str,
+        follow_default: bool,
+        input: &mut AudioInput,
+        stop: &AtomicBool,
+    ) -> Result<Ended> {
         let capture = client.get_audiocaptureclient().map_err(audio_error)?;
         let frame_bytes = CAPTURE_FORMAT.bytes_per_frame();
         let mut buffer = Vec::new();
+        // WASAPI flags the first packet after a start as a discontinuity.
+        let mut first_packet = true;
+        let mut polls = 0_u32;
         client.start_stream().map_err(audio_error)?;
 
         while !stop.load(Ordering::Relaxed) {
+            polls = polls.wrapping_add(1);
+            if follow_default
+                && polls.is_multiple_of(DEFAULT_CHECK_POLLS)
+                && default_changed(device_id)
+            {
+                client.stop_stream().map_err(audio_error)?;
+                return Ok(Ended::DefaultChanged);
+            }
             while let Some(frames) = capture.get_next_packet_size().map_err(audio_error)? {
                 if frames == 0 {
                     break;
@@ -228,14 +278,16 @@ mod windows {
                     // guaranteed to be zero.
                     bytes.fill(0);
                 }
-                if info.flags.data_discontinuity {
+                if info.flags.data_discontinuity && !first_packet {
                     warn!("loopback: capture glitch, audio skipped");
                 }
+                first_packet = false;
                 input.write(bytes);
             }
             thread::sleep(POLL_INTERVAL);
         }
-        client.stop_stream().map_err(audio_error)
+        client.stop_stream().map_err(audio_error)?;
+        Ok(Ended::Stopped)
     }
 }
 
