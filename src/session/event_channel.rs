@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpSocket, TcpStream};
 
 use crate::error::{Error, Result};
@@ -46,11 +47,27 @@ impl EventChannel {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.stream.local_addr()?)
     }
+
+    /// Read and discard what the receiver sends until it closes the
+    /// connection. Unread data would fill the TCP window and stall the
+    /// receiver's event writes. Closing ends the session, so it is an error.
+    pub async fn drain(mut self) -> Result<()> {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            if self.stream.read(&mut buffer).await? == 0 {
+                return Err(Error::Protocol(
+                    "receiver closed the event channel".to_owned(),
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::spawn;
 
     use super::*;
 
@@ -74,6 +91,28 @@ mod tests {
             peer_addr,
             channel.local_addr().expect("event local address")
         );
+    }
+
+    #[tokio::test]
+    async fn drain_discards_data_until_receiver_closes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let receiver = spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            stream
+                .write_all(b"POST /command RTSP/1.0\r\n\r\n")
+                .await
+                .expect("write");
+        });
+        let channel = EventChannel::connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port, None)
+            .await
+            .expect("connect");
+        receiver.await.expect("receiver");
+
+        let error = channel.drain().await.expect_err("close ends drain");
+        assert!(error.to_string().contains("closed the event channel"));
     }
 
     #[tokio::test]
