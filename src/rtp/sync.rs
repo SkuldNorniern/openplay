@@ -24,13 +24,16 @@ const SYNC_PACKET_TYPE: u8 = 0xd4;
 
 /// Build one sync packet.
 ///
-/// The RTP timestamp appears twice, matching a working HomePod session:
-/// bytes 4..8 and 16..20 both carry the timestamp of the audio packet sent
-/// right after this one.
+/// Bytes 16..20 carry the timestamp of the audio packet sent right after
+/// this one, and bytes 4..8 the timestamp playing now: that one less
+/// `latency_frames`. The receiver reads the gap as how far ahead audio is
+/// sent. The working HomePod capture used no gap, leaving the receiver to
+/// pick its own latency.
 pub fn build_sync_packet(
     sequence: u16,
     first: bool,
     rtp_timestamp: u32,
+    latency_frames: u32,
     now: NtpTimestamp,
 ) -> [u8; SYNC_PACKET_LEN] {
     let mut packet = [0_u8; SYNC_PACKET_LEN];
@@ -41,7 +44,7 @@ pub fn build_sync_packet(
     };
     packet[1] = SYNC_PACKET_TYPE;
     packet[2..4].copy_from_slice(&sequence.to_be_bytes());
-    packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+    packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(latency_frames).to_be_bytes());
     packet[8..16].copy_from_slice(&now.to_bytes());
     packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
     packet
@@ -57,6 +60,7 @@ pub struct SyncSender {
     /// retried with the extension bit still set.
     first_sent: bool,
     packets_until_sync: u32,
+    latency_frames: u32,
 }
 
 impl SyncSender {
@@ -73,7 +77,14 @@ impl SyncSender {
             sequence: 0,
             first_sent: false,
             packets_until_sync: 0,
+            latency_frames: 0,
         }
+    }
+
+    /// Announce a playout latency in each sync packet.
+    pub fn with_latency(mut self, latency_frames: u32) -> Self {
+        self.latency_frames = latency_frames;
+        self
     }
 
     /// Call right before each audio packet with that packet's RTP timestamp.
@@ -89,6 +100,7 @@ impl SyncSender {
             self.sequence,
             !self.first_sent,
             rtp_timestamp,
+            self.latency_frames,
             NtpTimestamp::now()?,
         );
         let sent = self.socket.send_to(&packet, self.receiver_addr).await?;
@@ -155,7 +167,7 @@ mod tests {
         ];
         let now = timestamp([0xee, 0x08, 0xca, 0x56, 0xdd, 0x7f, 0x62, 0xb6]);
 
-        assert_eq!(build_sync_packet(0, true, 0, now), captured);
+        assert_eq!(build_sync_packet(0, true, 0, 0, now), captured);
     }
 
     #[test]
@@ -166,7 +178,17 @@ mod tests {
         ];
         let now = timestamp([0xee, 0x08, 0xca, 0x57, 0xcc, 0xb1, 0xb8, 0x74]);
 
-        assert_eq!(build_sync_packet(2, false, 0xaea0, now), captured);
+        assert_eq!(build_sync_packet(2, false, 0xaea0, 0, now), captured);
+    }
+
+    #[test]
+    fn latency_moves_playing_timestamp_back() {
+        let packet = build_sync_packet(1, false, 1_000, 4_410, NtpTimestamp::from_bytes([0; 8]));
+        assert_eq!(
+            &packet[4..8],
+            &(1_000_u32.wrapping_sub(4_410)).to_be_bytes()
+        );
+        assert_eq!(&packet[16..20], &1_000_u32.to_be_bytes());
     }
 
     #[tokio::test]
