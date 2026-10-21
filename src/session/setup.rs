@@ -164,16 +164,26 @@ pub fn stream_setup_request(
 /// Receiver ports established by the stream-level SETUP exchange.
 pub struct StreamSetupResponse {
     pub data_port: u16,
-    pub control_port: u16,
+    /// Absent for buffered streams, which have no control channel use.
+    pub control_port: Option<u16>,
+}
+
+impl StreamSetupResponse {
+    /// The control port a realtime stream needs for sync and resends.
+    pub fn require_control_port(&self) -> Result<u16> {
+        self.control_port
+            .ok_or_else(|| Error::Protocol("stream setup: missing controlPort".into()))
+    }
 }
 
 /// Parse the stream-level SETUP response body.
 ///
 /// Receivers use both a flat response and a response mirroring the request's
-/// `streams` array, so the nested form is used when the flat pair is incomplete.
+/// `streams` array, so the nested form is used when there is no flat
+/// `dataPort`.
 pub fn parse_stream_setup_response(body: &[u8]) -> Result<StreamSetupResponse> {
     let plist = parse_dictionary(body, "stream setup")?;
-    let source = if plist.get("dataPort").is_some() && plist.get("controlPort").is_some() {
+    let source = if plist.get("dataPort").is_some() {
         &plist
     } else {
         plist
@@ -182,15 +192,16 @@ pub fn parse_stream_setup_response(body: &[u8]) -> Result<StreamSetupResponse> {
             .and_then(|streams| streams.first())
             .and_then(Value::as_dictionary)
             .ok_or_else(|| {
-                Error::Protocol(
-                    "stream setup: missing dataPort or controlPort at both locations".into(),
-                )
+                Error::Protocol("stream setup: missing dataPort at both locations".into())
             })?
     };
 
     Ok(StreamSetupResponse {
         data_port: port_field(source, "dataPort", "stream setup")?,
-        control_port: port_field(source, "controlPort", "stream setup")?,
+        control_port: source
+            .get("controlPort")
+            .map(|_| port_field(source, "controlPort", "stream setup"))
+            .transpose()?,
     })
 }
 
@@ -498,7 +509,7 @@ mod tests {
         flat.insert("controlPort".into(), Value::from(7001_i64));
         let parsed = parse_stream_setup_response(&plist_body(flat)).expect("parse flat setup");
         assert_eq!(parsed.data_port, 7000);
-        assert_eq!(parsed.control_port, 7001);
+        assert_eq!(parsed.control_port, Some(7001));
 
         let mut stream = Dictionary::new();
         stream.insert("dataPort".into(), Value::from(7100_i64));
@@ -510,9 +521,20 @@ mod tests {
         );
         let parsed = parse_stream_setup_response(&plist_body(nested)).expect("parse nested setup");
         assert_eq!(parsed.data_port, 7100);
-        assert_eq!(parsed.control_port, 7101);
+        assert_eq!(parsed.control_port, Some(7101));
 
         assert!(parse_stream_setup_response(&plist_body(Dictionary::new())).is_err());
+    }
+
+    #[test]
+    fn buffered_response_may_omit_control_port() {
+        let mut buffered = Dictionary::new();
+        buffered.insert("dataPort".into(), Value::from(7200_i64));
+        let parsed = parse_stream_setup_response(&plist_body(buffered)).expect("parse buffered");
+
+        assert_eq!(parsed.data_port, 7200);
+        assert_eq!(parsed.control_port, None);
+        assert!(parsed.require_control_port().is_err());
     }
 
     #[test]

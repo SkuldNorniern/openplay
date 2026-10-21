@@ -19,7 +19,7 @@ use rand::random;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::select;
 use tokio::task::{JoinError, JoinSet};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
+use tokio::time::{Instant, Interval, MissedTickBehavior, interval, sleep, timeout};
 
 use crate::audio::AudioSource;
 use crate::error::{Error, Result};
@@ -70,6 +70,9 @@ pub struct Streaming {
     session: SessionId,
     device: DeviceInfo,
     tasks: Tasks,
+    /// Kept across [`Self::run_until`] calls, so frequent returns (each
+    /// UI command) cannot starve the keepalive.
+    feedback: Interval,
 }
 
 /// A paired, encrypted control connection.
@@ -188,16 +191,17 @@ async fn start_realtime(
         .request(stream_setup_request(session, &ports, secret)?)
         .await?;
     let stream_ports = parse_stream_setup_response(&response.body)?;
+    let receiver_control_port = stream_ports.require_control_port()?;
     info!(
-        "stream setup done, data port {}, control port {}",
-        stream_ports.data_port, stream_ports.control_port
+        "stream setup done, data port {}, control port {receiver_control_port}",
+        stream_ports.data_port
     );
 
     let control_socket = Arc::new(control_socket);
     let history = PacketHistory::new(HISTORY_PACKETS);
     let sync = SyncSender::new(
         Arc::clone(&control_socket),
-        SocketAddr::new(receiver_ip, stream_ports.control_port),
+        SocketAddr::new(receiver_ip, receiver_control_port),
     );
     let resender = ResendResponder::new(control_socket, receiver_ip, history.clone());
     let mut sender = RtpSender::new(
@@ -442,11 +446,16 @@ async fn finish(
         }
         return Err(error);
     }
+    let mut feedback = interval(FEEDBACK_INTERVAL);
+    feedback.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick is immediate; RECORD has just been answered.
+    feedback.tick().await;
     Ok(Streaming {
         client,
         session,
         device,
         tasks,
+        feedback,
     })
 }
 
@@ -469,16 +478,12 @@ impl Streaming {
     /// Fails early when a background task stops or a keepalive is rejected,
     /// since the stream is broken in either case.
     pub async fn run_until<F: Future<Output = ()>>(&mut self, stop: F) -> Result<()> {
-        let mut feedback = interval(FEEDBACK_INTERVAL);
-        feedback.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // The first tick is immediate; RECORD has just been answered.
-        feedback.tick().await;
         let mut stop = pin!(stop);
 
         loop {
             select! {
                 () = &mut stop => return Ok(()),
-                _ = feedback.tick() => {
+                _ = self.feedback.tick() => {
                     self.client.request(Request::new("POST", "/feedback")).await?;
                 }
                 Some(joined) = self.tasks.join_next() => return task_ended(joined),
