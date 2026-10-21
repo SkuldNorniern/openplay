@@ -5,6 +5,8 @@
 
 pub mod follower;
 pub mod message;
+pub mod node;
 
 pub use follower::{Action, Follower, FollowerClock, Sample};
 pub use message::{Body, Message, PortIdentity, Timestamp};
+pub use node::{EVENT_PORT, GENERAL_PORT, LocalClock, PtpNode, PtpTime};
