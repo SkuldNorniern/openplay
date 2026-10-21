@@ -2,6 +2,9 @@
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::str::FromStr;
+
+use crate::audio::{PcmFormat, SampleFormat};
 
 /// What the binary was asked to do.
 pub enum Command {
@@ -9,7 +12,8 @@ pub enum Command {
     Discover,
     /// Show one receiver's details from its `/info`.
     Info { target: String },
-    /// Stream a WAV file to a receiver (name or IP).
+    /// Stream a WAV file, or raw PCM from stdin when `file` is `-`, to a
+    /// receiver (name or IP).
     Play { target: String, file: PathBuf },
 }
 
@@ -22,6 +26,8 @@ pub struct Cli {
     pub volume: Option<u8>,
     /// Use a buffered, PTP-timed stream instead of realtime.
     pub buffered: bool,
+    /// Layout of raw PCM read from stdin.
+    pub pcm: PcmFormat,
     pub verbose: bool,
 }
 
@@ -42,15 +48,20 @@ pub fn usage() -> &'static str {
      \x20 openplay --discover [--iface <ip>]\n\
      \x20 openplay --info <target> [--iface <ip>]\n\
      \x20 openplay <target> <file.wav> [--iface <ip>] [--volume <0-100>] [--buffered]\n\
+     \x20 openplay <target> - [--rate <hz>] [--channels <n>] [--sample <s16|s24|s32|f32>]\n\
      \n\
      options:\n\
      \x20 -i, --iface <ip>  bind to this local IPv4 (LAN interface)\n\
      \x20 --volume <0-100>  playback volume, 0 mutes\n\
      \x20 --buffered        buffered stream timed by PTP (experimental)\n\
+     \x20 --rate <hz>       stdin sample rate (default 44100)\n\
+     \x20 --channels <n>    stdin channel count (default 2)\n\
+     \x20 --sample <type>   stdin sample type: s16, s24, s32 or f32 (default s16)\n\
      \x20 -v, --verbose     more log detail\n\
      \x20 -h, --help        show this help\n\
      \n\
-     <target> is a receiver name (e.g. Speaker) or an IP address."
+     <target> is a receiver name (e.g. Speaker) or an IP address.\n\
+     A file of - reads interleaved little-endian PCM from stdin."
 }
 
 /// Parse process arguments (excluding argv[0]).
@@ -58,6 +69,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     let mut bind = None;
     let mut volume = None;
     let mut buffered = false;
+    let mut pcm = PcmFormat::AIRPLAY;
     let mut verbose = false;
     let mut discover = false;
     let mut info = None;
@@ -76,6 +88,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
             "-v" | "--verbose" => verbose = true,
             "--discover" => discover = true,
             "--buffered" => buffered = true,
+            "--rate" => pcm.sample_rate = parse_value(it.next())?,
+            "--channels" => pcm.channels = parse_value(it.next())?,
+            "--sample" => {
+                pcm.sample = match it.next().as_deref() {
+                    Some("s16") => SampleFormat::I16,
+                    Some("s24") => SampleFormat::I24,
+                    Some("s32") => SampleFormat::I32,
+                    Some("f32") => SampleFormat::F32,
+                    _ => return Err(CliError::Usage),
+                }
+            }
             "--info" => info = Some(it.next().ok_or(CliError::Usage)?),
             "-i" | "--iface" => {
                 let val = it.next().ok_or(CliError::Usage)?;
@@ -90,19 +113,30 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
                 }
                 volume = Some(level);
             }
+            // A lone dash is the stdin file argument, not an option.
+            "-" => positionals.push(arg),
             other if other.starts_with('-') => return Err(CliError::Usage),
             _ => positionals.push(arg),
         }
     }
 
+    pcm.validate().map_err(|_| CliError::Usage)?;
     let command = build_command(discover, info, positionals)?;
     Ok(Cli {
         command,
         bind,
         volume,
         buffered,
+        pcm,
         verbose,
     })
+}
+
+fn parse_value<T: FromStr>(value: Option<String>) -> Result<T, CliError> {
+    value
+        .ok_or(CliError::Usage)?
+        .parse()
+        .map_err(|_| CliError::Usage)
 }
 
 fn build_command(
@@ -174,6 +208,40 @@ mod tests {
             parse(["--info", "Speaker", "--discover"].map(String::from)),
             Err(CliError::Usage)
         ));
+    }
+
+    #[test]
+    fn parses_stdin_pcm_format() {
+        let cli = parse_ok(&[
+            "Speaker",
+            "-",
+            "--rate",
+            "48000",
+            "--channels",
+            "6",
+            "--sample",
+            "f32",
+        ]);
+        assert_eq!(
+            cli.pcm,
+            PcmFormat {
+                sample_rate: 48_000,
+                channels: 6,
+                sample: SampleFormat::F32
+            }
+        );
+        assert_eq!(parse_ok(&["Speaker", "-"]).pcm, PcmFormat::AIRPLAY);
+        for bad in [
+            &["Speaker", "-", "--sample", "u8"][..],
+            &["Speaker", "-", "--rate", "fast"],
+            &["Speaker", "-", "--channels", "0"],
+            &["Speaker", "-", "--rate"],
+        ] {
+            assert!(matches!(
+                parse(bad.iter().map(|s| s.to_string())),
+                Err(CliError::Usage)
+            ));
+        }
     }
 
     #[test]

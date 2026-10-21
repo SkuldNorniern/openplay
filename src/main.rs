@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use log::info;
-use openplay::audio::{AudioInput, WavAudio, parse_wav};
+use openplay::audio::{AudioInput, PcmFormat, WavAudio, parse_wav};
 use openplay::cli::{self, CliError, Command};
 use openplay::device::{self, Device, DeviceKind, Features};
 use openplay::info;
@@ -16,6 +16,7 @@ use openplay::logging;
 use openplay::sender::{Sender, SenderConfig, Status, StreamMode};
 use openplay::session::USER_AGENT;
 use openplay::{Error, Result};
+use tokio::io::{AsyncReadExt, stdin};
 use tokio::signal::ctrl_c;
 use tokio::sync::watch;
 use tokio::time::sleep;
@@ -60,7 +61,18 @@ async fn main() -> ExitCode {
         Command::Discover => run_discover(cli.bind).await,
         Command::Info { target } => run_info(&target, cli.bind).await,
         Command::Play { target, file } => {
-            run_play(&target, &file, cli.bind, cli.volume, cli.buffered).await
+            let feed = if file == Path::new("-") {
+                Ok(Feed::Stdin(cli.pcm))
+            } else {
+                fs::read(&file)
+                    .map_err(Error::from)
+                    .and_then(|bytes| parse_wav(&bytes))
+                    .map(Feed::File)
+            };
+            match feed {
+                Ok(feed) => run_play(&target, feed, cli.bind, cli.volume, cli.buffered).await,
+                Err(error) => Err(error),
+            }
         }
     };
 
@@ -125,15 +137,25 @@ async fn run_info(target: &str, bind: Option<Ipv4Addr>) -> Result<()> {
     Ok(())
 }
 
+/// Where the audio comes from.
+enum Feed {
+    File(WavAudio),
+    /// Live PCM on stdin, from a capture tool such as `parec`.
+    Stdin(PcmFormat),
+}
+
 async fn run_play(
     target: &str,
-    file: &Path,
+    feed: Feed,
     bind: Option<Ipv4Addr>,
     volume: Option<u8>,
     buffered: bool,
 ) -> Result<()> {
-    let audio = parse_wav(&fs::read(file)?)?;
     let addr = resolve(target, bind).await?;
+    let (format, live, name) = match &feed {
+        Feed::File(audio) => (audio.format, false, "file"),
+        Feed::Stdin(format) => (*format, true, "stdin"),
+    };
     let config = SenderConfig {
         bind,
         mode: if buffered {
@@ -142,18 +164,21 @@ async fn run_play(
             StreamMode::Realtime
         },
         volume,
-        // The file is fed at the sender's pace, so there is no clock to follow.
-        drift_correction: false,
-        max_retries: Some(PLAY_RETRIES),
+        // A file is fed at the sender's pace; only live input has its own
+        // clock to follow.
+        drift_correction: live,
+        // A live source should outlast receiver hiccups; a file run fails
+        // fast instead.
+        max_retries: if live { None } else { Some(PLAY_RETRIES) },
         ..SenderConfig::default()
     };
-    let (sender, input) = Sender::start(addr, audio.format, config)?;
-    let logger = spawn(log_status(sender.status(), file.display().to_string()));
+    let (sender, input) = Sender::start(addr, format, config)?;
+    let logger = spawn(log_status(sender.status(), name));
 
     let mut status = sender.status();
     let outcome = select! {
         _ = ctrl_c() => Ok(()),
-        () = feed(input, &sender, &audio) => Ok(()),
+        fed = feed_input(input, &sender, feed) => fed,
         failed = status.wait_for(|status| matches!(status, Status::Failed { .. })) => {
             match failed.map(|status| status.clone()) {
                 Ok(Status::Failed { error }) => Err(Error::Protocol(error)),
@@ -171,12 +196,50 @@ async fn run_play(
     outcome
 }
 
+async fn feed_input(input: AudioInput, sender: &Sender, feed: Feed) -> Result<()> {
+    match feed {
+        Feed::File(audio) => {
+            feed_file(input, sender, &audio).await;
+            Ok(())
+        }
+        Feed::Stdin(format) => feed_stdin(input, sender, format).await,
+    }
+}
+
+/// Pass stdin through as it arrives; the capture tool sets the pace.
+async fn feed_stdin(mut input: AudioInput, sender: &Sender, format: PcmFormat) -> Result<()> {
+    let period_frames = (u128::from(format.sample_rate) * FEED_PERIOD.as_millis() / 1000) as usize;
+    let mut buffer = vec![0_u8; period_frames * format.bytes_per_frame()];
+    let mut stdin = stdin();
+    loop {
+        let read = stdin.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        input.write(&buffer[..read]);
+    }
+    drain(sender).await;
+    Ok(())
+}
+
+/// Wait for queued audio to go out and play. Nothing drains the queue
+/// without a session, so give up on it once the stream is down.
+async fn drain(sender: &Sender) {
+    let streaming = || matches!(*sender.status().borrow(), Status::Streaming { .. });
+    while sender.buffered_frames() > 0 && streaming() {
+        sleep(FEED_POLL).await;
+    }
+    if streaming() {
+        sleep(PLAYOUT_TAIL).await;
+    }
+}
+
 /// Print status changes as they happen.
-async fn log_status(mut status: watch::Receiver<Status>, file: String) {
+async fn log_status(mut status: watch::Receiver<Status>, name: &'static str) {
     loop {
         match status.borrow_and_update().clone() {
             Status::Streaming { receiver } => {
-                println!("streaming {file} to {receiver}, ctrl-c to stop");
+                println!("streaming {name} to {receiver}, ctrl-c to stop");
             }
             // The sender logs reconnects itself.
             Status::Connecting
@@ -206,7 +269,7 @@ async fn resolve(target: &str, bind: Option<Ipv4Addr>) -> Result<SocketAddr> {
 
 /// Feed the file through the same conversion a live driver uses, in engine
 /// sized chunks, no faster than the sender drains them.
-async fn feed(mut input: AudioInput, sender: &Sender, audio: &WavAudio) {
+async fn feed_file(mut input: AudioInput, sender: &Sender, audio: &WavAudio) {
     let period_frames =
         (u128::from(audio.format.sample_rate) * FEED_PERIOD.as_millis() / 1000) as usize;
     for chunk in audio
@@ -218,8 +281,5 @@ async fn feed(mut input: AudioInput, sender: &Sender, audio: &WavAudio) {
         }
         input.write(chunk);
     }
-    while sender.buffered_frames() > 0 {
-        sleep(FEED_POLL).await;
-    }
-    sleep(PLAYOUT_TAIL).await;
+    drain(sender).await;
 }
