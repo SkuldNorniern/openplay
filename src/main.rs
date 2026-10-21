@@ -2,9 +2,11 @@
 
 use std::env;
 use std::fs;
+use std::io::{self, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::process::ExitCode;
+use std::thread;
 use std::time::Duration;
 
 use log::info;
@@ -17,9 +19,8 @@ use openplay::logging;
 use openplay::sender::{DEFAULT_CAPACITY_FRAMES, Sender, SenderConfig, Status, StreamMode};
 use openplay::session::USER_AGENT;
 use openplay::{Error, Result};
-use tokio::io::{AsyncReadExt, stdin};
 use tokio::signal::ctrl_c;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tokio::{select, spawn};
 
@@ -35,6 +36,10 @@ const FEED_POLL: Duration = Duration::from_millis(4);
 /// Receiver buffers about two seconds; wait that long after the last packet
 /// before TEARDOWN so the end of the file is still heard.
 const PLAYOUT_TAIL: Duration = Duration::from_secs(2);
+/// Extra wait past a reported latency before TEARDOWN.
+const PLAYOUT_MARGIN: Duration = Duration::from_millis(500);
+/// Chunks of stdin buffered between the reader thread and the sender.
+const STDIN_QUEUE: usize = 16;
 /// A receiver now and then rejects stream SETUP when its clock exchange
 /// has not started yet; one fresh session usually works.
 const PLAY_RETRIES: u32 = 1;
@@ -196,17 +201,39 @@ async fn feed_input(input: AudioInput, sender: &Sender, feed: Feed) -> Result<()
 /// Pass stdin through as it arrives; the capture tool sets the pace.
 async fn feed_stdin(mut input: AudioInput, sender: &Sender, format: PcmFormat) -> Result<()> {
     let period_frames = (u128::from(format.sample_rate) * FEED_PERIOD.as_millis() / 1000) as usize;
-    let mut buffer = vec![0_u8; period_frames * format.bytes_per_frame()];
-    let mut stdin = stdin();
-    loop {
-        let read = stdin.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        input.write(&buffer[..read]);
+    let mut chunks = read_stdin(period_frames * format.bytes_per_frame());
+    while let Some(chunk) = chunks.recv().await {
+        input.write(&chunk?);
     }
     drain(sender, false).await;
     Ok(())
+}
+
+/// Read stdin on a plain thread, in chunks of up to `chunk_len` bytes; the
+/// channel closes at end of input.
+///
+/// Tokio's stdin blocks runtime shutdown until a pending read returns, so
+/// ctrl-c would hang on a quiet pipe. A detached thread ends with the
+/// process instead.
+fn read_stdin(chunk_len: usize) -> mpsc::Receiver<Result<Vec<u8>>> {
+    let (chunks, receiver) = mpsc::channel(STDIN_QUEUE);
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buffer = vec![0_u8; chunk_len];
+        loop {
+            let chunk = match stdin.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => Ok(buffer[..read].to_vec()),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => Err(error.into()),
+            };
+            let failed = chunk.is_err();
+            if chunks.blocking_send(chunk).is_err() || failed {
+                return;
+            }
+        }
+    });
+    receiver
 }
 
 /// Wait for queued audio to go out and play.
@@ -223,8 +250,13 @@ async fn drain(sender: &Sender, wait_for_session: bool) {
     while sender.buffered_frames() > 0 && waiting() {
         sleep(FEED_POLL).await;
     }
-    if matches!(*sender.status().borrow(), Status::Streaming { .. }) {
-        sleep(PLAYOUT_TAIL).await;
+    // The receiver plays the last packet its own latency after it arrives.
+    let latency = match *sender.status().borrow() {
+        Status::Streaming { latency, .. } => Some(latency),
+        _ => None,
+    };
+    if let Some(latency) = latency {
+        sleep(PLAYOUT_TAIL.max(latency + PLAYOUT_MARGIN)).await;
     }
 }
 
