@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use log::warn;
 use openplay::audio::{AudioSource, Frame, PcmSamples, parse_wav};
 use openplay::cli::{self, CliError, Command};
 use openplay::device::{self, Device, DeviceKind, Features};
@@ -27,6 +28,7 @@ const FEED_POLL: Duration = Duration::from_millis(4);
 /// Receiver buffers about two seconds; wait that long after the last packet
 /// before TEARDOWN so the end of the file is still heard.
 const PLAYOUT_TAIL: Duration = Duration::from_secs(2);
+const START_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -51,7 +53,7 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Discover => run_discover(cli.bind).await,
         Command::Info { target } => run_info(&target, cli.bind).await,
-        Command::Play { target, file } => run_play(&target, &file, cli.bind).await,
+        Command::Play { target, file } => run_play(&target, &file, cli.bind, cli.volume).await,
     };
 
     match result {
@@ -115,12 +117,29 @@ async fn run_info(target: &str, bind: Option<Ipv4Addr>) -> Result<()> {
     Ok(())
 }
 
-async fn run_play(target: &str, file: &Path, bind: Option<Ipv4Addr>) -> Result<()> {
+async fn run_play(
+    target: &str,
+    file: &Path,
+    bind: Option<Ipv4Addr>,
+    volume: Option<u8>,
+) -> Result<()> {
     let samples = parse_wav(&fs::read(file)?)?;
     let addr = resolve(target, bind).await?;
     let source = AudioSource::new(QUEUED_PACKETS);
 
-    let mut streaming = session::start(addr, bind, source.clone()).await?;
+    let mut streaming = match session::start(addr, bind, source.clone()).await {
+        Ok(streaming) => streaming,
+        Err(error) => {
+            // A receiver now and then rejects stream SETUP when its clock
+            // exchange has not started yet; a fresh session usually works.
+            warn!("{error}, retrying");
+            sleep(START_RETRY_DELAY).await;
+            session::start(addr, bind, source.clone()).await?
+        }
+    };
+    if let Some(volume) = volume {
+        streaming.set_volume(volume).await?;
+    }
     println!(
         "streaming {} to {} ({addr}), ctrl-c to stop",
         file.display(),

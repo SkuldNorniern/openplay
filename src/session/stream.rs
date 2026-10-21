@@ -8,6 +8,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::pin;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 use std::time::Duration;
 
 use log::{info, warn};
@@ -20,13 +21,17 @@ use crate::audio::AudioSource;
 use crate::error::{Error, Result};
 use crate::info::DeviceInfo;
 use crate::pairing::{PairSetup, Paired, Tlv};
-use crate::rtp::{RtpSender, SyncSender, TimingResponder, bind_udp};
+use crate::rtp::{
+    HISTORY_PACKETS, PacketHistory, ResendResponder, RtpSender, SyncSender, TimingResponder,
+    bind_udp,
+};
 use crate::rtsp::Request;
 
 use super::client::{Identity, RtspClient};
 use super::{
     AudioStreamSecret, EventChannel, LocalStreamPorts, SessionId, parse_session_setup_response,
     parse_stream_setup_response, record_request, session_setup_request, stream_setup_request,
+    volume_db, volume_request,
 };
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
@@ -37,11 +42,25 @@ pub struct Streaming {
     client: RtspClient<TcpStream>,
     session: SessionId,
     device: DeviceInfo,
-    /// Held open for the session's lifetime; the receiver tears down the
-    /// session when it closes.
-    _event_channel: EventChannel,
     timing_task: JoinHandle<Result<()>>,
-    audio_task: JoinHandle<Result<()>>,
+    tasks: StreamTasks,
+}
+
+/// Background work started once the stream is set up.
+struct StreamTasks {
+    audio: JoinHandle<Result<()>>,
+    resend: JoinHandle<Result<()>>,
+    /// Keeps the event connection open and drained; the receiver tears down
+    /// the session when it closes.
+    events: JoinHandle<Result<()>>,
+}
+
+impl StreamTasks {
+    fn abort(&self) {
+        self.audio.abort();
+        self.resend.abort();
+        self.events.abort();
+    }
 }
 
 /// Connect to the receiver at `addr`, set up a session, and start sending
@@ -101,7 +120,7 @@ pub async fn start(
         source,
     )
     .await;
-    let (event_channel, audio_task) = match started {
+    let tasks = match started {
         Ok(started) => started,
         Err(error) => {
             // Leaving a half-built session behind makes the receiver ignore
@@ -118,9 +137,8 @@ pub async fn start(
         client,
         session,
         device,
-        _event_channel: event_channel,
         timing_task,
-        audio_task,
+        tasks,
     })
 }
 
@@ -136,7 +154,7 @@ async fn start_stream(
     addr: SocketAddr,
     bind: Option<Ipv4Addr>,
     source: AudioSource,
-) -> Result<(EventChannel, JoinHandle<Result<()>>)> {
+) -> Result<StreamTasks> {
     let receiver_ip = addr.ip();
     let event_channel = EventChannel::connect(receiver_ip, event_port, bind).await?;
 
@@ -156,21 +174,28 @@ async fn start_stream(
         stream_ports.data_port, stream_ports.control_port
     );
 
+    let control_socket = Arc::new(control_socket);
+    let history = PacketHistory::new(HISTORY_PACKETS);
     let sync = SyncSender::new(
-        control_socket,
+        Arc::clone(&control_socket),
         SocketAddr::new(receiver_ip, stream_ports.control_port),
     );
+    let resender = ResendResponder::new(control_socket, receiver_ip, history.clone());
     let mut sender = RtpSender::new(
         audio_socket,
         SocketAddr::new(receiver_ip, stream_ports.data_port),
         source,
         secret.audio_key(),
     )
-    .with_sync(sync);
+    .with_sync(sync)
+    .with_history(history);
 
     client.request(record_request(session)).await?;
-    let audio_task = spawn(async move { sender.run().await });
-    Ok((event_channel, audio_task))
+    Ok(StreamTasks {
+        audio: spawn(async move { sender.run().await }),
+        resend: spawn(async move { resender.run().await }),
+        events: spawn(event_channel.drain()),
+    })
 }
 
 impl Streaming {
@@ -179,10 +204,18 @@ impl Streaming {
         &self.device
     }
 
+    /// Set playback volume, 0 (mute) to 100.
+    pub async fn set_volume(&mut self, percent: u8) -> Result<()> {
+        self.client
+            .request(volume_request(&self.session, volume_db(percent)))
+            .await?;
+        Ok(())
+    }
+
     /// Keep the session alive until `stop` completes.
     ///
-    /// Fails early when the audio or timing task stops or a keepalive is
-    /// rejected, since the receiver drops the stream in either case.
+    /// Fails early when a background task stops or a keepalive is rejected,
+    /// since the stream is broken in either case.
     pub async fn run_until<F: Future<Output = ()>>(&mut self, stop: F) -> Result<()> {
         let mut feedback = interval(FEEDBACK_INTERVAL);
         feedback.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -196,7 +229,9 @@ impl Streaming {
                 _ = feedback.tick() => {
                     self.client.request(Request::new("POST", "/feedback")).await?;
                 }
-                result = &mut self.audio_task => return task_ended("audio", result),
+                result = &mut self.tasks.audio => return task_ended("audio", result),
+                result = &mut self.tasks.resend => return task_ended("resend", result),
+                result = &mut self.tasks.events => return task_ended("event channel", result),
                 result = &mut self.timing_task => return task_ended("timing", result),
             }
         }
@@ -204,7 +239,7 @@ impl Streaming {
 
     /// Stop the background tasks and send TEARDOWN.
     pub async fn teardown(mut self) -> Result<()> {
-        self.audio_task.abort();
+        self.tasks.abort();
         self.timing_task.abort();
         self.client.request(teardown_request(&self.session)).await?;
         Ok(())

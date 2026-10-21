@@ -18,6 +18,8 @@ pub struct Cli {
     pub command: Command,
     /// Local IPv4 to bind (the LAN interface), pinning the egress path.
     pub bind: Option<Ipv4Addr>,
+    /// Playback volume 0 to 100; the receiver's current volume when unset.
+    pub volume: Option<u8>,
     pub verbose: bool,
 }
 
@@ -37,10 +39,11 @@ pub fn usage() -> &'static str {
      usage:\n\
      \x20 openplay --discover [--iface <ip>]\n\
      \x20 openplay --info <target> [--iface <ip>]\n\
-     \x20 openplay <target> <file.wav> [--iface <ip>]\n\
+     \x20 openplay <target> <file.wav> [--iface <ip>] [--volume <0-100>]\n\
      \n\
      options:\n\
      \x20 -i, --iface <ip>  bind to this local IPv4 (LAN interface)\n\
+     \x20 --volume <0-100>  playback volume, 0 mutes\n\
      \x20 -v, --verbose     more log detail\n\
      \x20 -h, --help        show this help\n\
      \n\
@@ -50,6 +53,7 @@ pub fn usage() -> &'static str {
 /// Parse process arguments (excluding argv[0]).
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     let mut bind = None;
+    let mut volume = None;
     let mut verbose = false;
     let mut discover = false;
     let mut info = None;
@@ -73,6 +77,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
                 let ip = val.parse::<Ipv4Addr>().map_err(|_| CliError::Usage)?;
                 bind = Some(ip);
             }
+            "--volume" => {
+                let val = it.next().ok_or(CliError::Usage)?;
+                let level = val.parse::<u8>().map_err(|_| CliError::Usage)?;
+                if level > 100 {
+                    return Err(CliError::Usage);
+                }
+                volume = Some(level);
+            }
             other if other.starts_with('-') => return Err(CliError::Usage),
             _ => positionals.push(arg),
         }
@@ -82,6 +94,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     Ok(Cli {
         command,
         bind,
+        volume,
         verbose,
     })
 }
@@ -155,6 +168,21 @@ mod tests {
             parse(["--info", "Speaker", "--discover"].map(String::from)),
             Err(CliError::Usage)
         ));
+    }
+
+    #[test]
+    fn parses_volume_in_range_only() {
+        assert_eq!(
+            parse_ok(&["Speaker", "song.wav", "--volume", "35"]).volume,
+            Some(35)
+        );
+        assert_eq!(parse_ok(&["Speaker", "song.wav"]).volume, None);
+        for bad in ["101", "-1", "loud"] {
+            assert!(matches!(
+                parse(["Speaker", "song.wav", "--volume", bad].map(String::from)),
+                Err(CliError::Usage)
+            ));
+        }
     }
 
     #[test]
