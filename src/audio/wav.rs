@@ -1,38 +1,43 @@
-//! Minimal RIFF/WAVE parsing for the fixed PCM format streamed by openplay.
+//! Minimal RIFF/WAVE parsing: integer and float PCM in any layout.
+//!
+//! The samples are returned as raw bytes with their [`PcmFormat`], and go
+//! through the same [`super::AudioInput`] conversion as live audio.
 
+use super::format::{PcmFormat, SampleFormat};
 use crate::error::{Error, Result};
 
-const CHANNELS: u16 = 2;
-const SAMPLE_RATE: u32 = 44_100;
-const BITS_PER_SAMPLE: u16 = 16;
-const BYTES_PER_FRAME: usize = 4;
+const FORMAT_PCM: u16 = 1;
+const FORMAT_FLOAT: u16 = 3;
+const FORMAT_EXTENSIBLE: u16 = 0xfffe;
+/// Offset of the sub-format GUID, whose first two bytes are the real
+/// format tag, in a WAVE_FORMAT_EXTENSIBLE `fmt ` chunk.
+const SUBFORMAT_OFFSET: usize = 24;
 
-/// Upper bound on a WAV file's `data` chunk: about 1.7 hours of 44100/16/2
-/// audio, generously beyond anything this crate streams in one file. Rejects
-/// a corrupt or absurd declared length before allocating PCM storage
+/// Upper bound on a WAV file's `data` chunk, about 1.7 hours of CD audio.
+/// Rejects a corrupt or absurd declared length before allocating storage
 /// proportional to it, the same defense-in-depth this crate already applies
 /// to other parsed-input-driven allocations (see e.g. `info::MAX_INFO_RESPONSE`).
 const MAX_DATA_LEN: usize = 1 << 30;
 
-/// Interleaved 16-bit PCM samples decoded from a WAV file, already validated
-/// as 44100 Hz / 16-bit / stereo -- the only format this crate streams.
-pub struct PcmSamples {
-    /// Interleaved i16 samples: `[L0, R0, L1, R1, ...]`.
-    pub interleaved: Vec<i16>,
+/// Audio from a WAV file, still in the file's own format.
+pub struct WavAudio {
+    pub format: PcmFormat,
+    /// Interleaved little-endian samples, whole frames only.
+    pub data: Vec<u8>,
 }
 
-impl PcmSamples {
-    /// Number of stereo frames (`interleaved.len() / 2`).
+impl WavAudio {
     pub fn frame_count(&self) -> usize {
-        self.interleaved.len() / usize::from(CHANNELS)
+        self.data.len() / self.format.bytes_per_frame()
     }
 }
 
-/// Parse a WAV file's bytes and validate it matches this crate's fixed audio
-/// format (44100 Hz, 16-bit, stereo).
+/// Parse a WAV file's bytes.
 ///
-/// Any other format is rejected rather than resampled or reinterpreted.
-pub fn parse_wav(bytes: &[u8]) -> Result<PcmSamples> {
+/// Accepts 16, 24 and 32-bit integer PCM and 32-bit float, including the
+/// WAVE_FORMAT_EXTENSIBLE header, at any channel count and sample rate that
+/// [`PcmFormat::validate`] allows.
+pub fn parse_wav(bytes: &[u8]) -> Result<WavAudio> {
     if bytes.get(0..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WAVE") {
         return Err(Error::Protocol("wav: missing RIFF/WAVE header".into()));
     }
@@ -90,21 +95,18 @@ pub fn parse_wav(bytes: &[u8]) -> Result<PcmSamples> {
     }
 
     let format = format.ok_or_else(|| Error::Protocol("wav: missing fmt chunk".into()))?;
-    validate_format(format)?;
+    let format = pcm_format(format)?;
     let data = data.ok_or_else(|| Error::Protocol("wav: missing data chunk".into()))?;
-    if data.len() % BYTES_PER_FRAME != 0 {
+    if data.len() % format.bytes_per_frame() != 0 {
         return Err(Error::Protocol(
-            "wav: data length is not a whole stereo frame".into(),
+            "wav: data length is not a whole number of frames".into(),
         ));
     }
 
-    let mut interleaved = Vec::with_capacity(data.len() / 2);
-    for sample in data.chunks_exact(2) {
-        let bytes = [sample[0], sample[1]];
-        interleaved.push(i16::from_le_bytes(bytes));
-    }
-
-    Ok(PcmSamples { interleaved })
+    Ok(WavAudio {
+        format,
+        data: data.to_vec(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +115,8 @@ struct WaveFormat {
     channels: u16,
     sample_rate: u32,
     bits_per_sample: u16,
+    /// Real format tag of an extensible header.
+    subformat: Option<u16>,
 }
 
 fn parse_format(chunk: &[u8]) -> Result<WaveFormat> {
@@ -126,35 +130,38 @@ fn parse_format(chunk: &[u8]) -> Result<WaveFormat> {
         channels: read_u16(chunk, 2, "channel count")?,
         sample_rate: read_u32(chunk, 4, "sample rate")?,
         bits_per_sample: read_u16(chunk, 14, "bits per sample")?,
+        subformat: read_u16(chunk, SUBFORMAT_OFFSET, "sub-format").ok(),
     })
 }
 
-fn validate_format(format: WaveFormat) -> Result<()> {
-    if format.audio_format != 1 {
-        return Err(Error::Protocol(format!(
-            "wav: unsupported audio format {} (expected PCM format 1)",
-            format.audio_format
-        )));
-    }
-    if format.channels != CHANNELS {
-        return Err(Error::Protocol(format!(
-            "wav: unsupported channel count {} (expected {CHANNELS})",
-            format.channels
-        )));
-    }
-    if format.sample_rate != SAMPLE_RATE {
-        return Err(Error::Protocol(format!(
-            "wav: unsupported sample rate {} (expected {SAMPLE_RATE})",
-            format.sample_rate
-        )));
-    }
-    if format.bits_per_sample != BITS_PER_SAMPLE {
-        return Err(Error::Protocol(format!(
-            "wav: unsupported bit depth {} (expected {BITS_PER_SAMPLE})",
-            format.bits_per_sample
-        )));
-    }
-    Ok(())
+fn pcm_format(format: WaveFormat) -> Result<PcmFormat> {
+    let tag = match (format.audio_format, format.subformat) {
+        (FORMAT_EXTENSIBLE, Some(subformat)) => subformat,
+        (FORMAT_EXTENSIBLE, None) => {
+            return Err(Error::Protocol(
+                "wav: extensible fmt chunk without sub-format".into(),
+            ));
+        }
+        (tag, _) => tag,
+    };
+    let sample = match (tag, format.bits_per_sample) {
+        (FORMAT_PCM, 16) => SampleFormat::I16,
+        (FORMAT_PCM, 24) => SampleFormat::I24,
+        (FORMAT_PCM, 32) => SampleFormat::I32,
+        (FORMAT_FLOAT, 32) => SampleFormat::F32,
+        (tag, bits) => {
+            return Err(Error::Protocol(format!(
+                "wav: unsupported encoding: format {tag} at {bits} bits"
+            )));
+        }
+    };
+    let pcm = PcmFormat {
+        sample_rate: format.sample_rate,
+        channels: format.channels,
+        sample,
+    };
+    pcm.validate()?;
+    Ok(pcm)
 }
 
 fn read_u16(bytes: &[u8], offset: usize, field: &str) -> Result<u16> {
@@ -203,17 +210,63 @@ mod tests {
 
     #[test]
     fn parses_tone_fixture() {
-        let pcm = parse_wav(TONE).expect("parse fixture");
-        assert_eq!(pcm.frame_count(), 1156);
-        assert_eq!(pcm.interleaved.len(), 2312);
+        let audio = parse_wav(TONE).expect("parse fixture");
+        assert_eq!(audio.format, PcmFormat::AIRPLAY);
+        assert_eq!(audio.frame_count(), 1156);
     }
 
     #[test]
-    fn rejects_wrong_format_fields() {
-        assert!(parse_wav(&wave(1, 2, 48_000, 16)).is_err());
-        assert!(parse_wav(&wave(1, 1, 44_100, 16)).is_err());
+    fn accepts_common_layouts() {
+        for (tag, channels, rate, bits, sample) in [
+            (1, 2, 48_000, 16, SampleFormat::I16),
+            (1, 1, 44_100, 24, SampleFormat::I24),
+            (1, 6, 96_000, 32, SampleFormat::I32),
+            (3, 2, 48_000, 32, SampleFormat::F32),
+        ] {
+            let audio = parse_wav(&wave(tag, channels, rate, bits)).expect("parse layout");
+            assert_eq!(
+                audio.format,
+                PcmFormat {
+                    sample_rate: rate,
+                    channels,
+                    sample
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn reads_extensible_sub_format() {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&60u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&0xfffe_u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&384_000u32.to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&22u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT starts with format tag 3.
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 14]);
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let audio = parse_wav(&bytes).expect("parse extensible");
+        assert_eq!(audio.format.sample, SampleFormat::F32);
+    }
+
+    #[test]
+    fn rejects_unsupported_encodings() {
         assert!(parse_wav(&wave(1, 2, 44_100, 8)).is_err());
         assert!(parse_wav(&wave(3, 2, 44_100, 16)).is_err());
+        assert!(parse_wav(&wave(2, 2, 44_100, 16)).is_err());
+        assert!(parse_wav(&wave(1, 0, 44_100, 16)).is_err());
+        assert!(parse_wav(&wave(1, 2, 1_000, 16)).is_err());
     }
 
     #[test]
@@ -230,8 +283,8 @@ mod tests {
         let riff_size = u32::try_from(bytes.len() - 8).expect("test wave fits in RIFF");
         bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
-        let pcm = parse_wav(&bytes).expect("parse extra chunk");
-        assert_eq!(pcm.interleaved, [1, -2]);
+        let audio = parse_wav(&bytes).expect("parse extra chunk");
+        assert_eq!(audio.data, [1, 0, 0xfe, 0xff]);
     }
 
     #[test]

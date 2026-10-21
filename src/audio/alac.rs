@@ -2,7 +2,6 @@
 
 use alac_encoder::{AlacEncoder as InnerEncoder, FormatDescription};
 
-use super::wav::PcmSamples;
 use crate::error::{Error, Result};
 
 const SAMPLE_RATE: f64 = 44_100.0;
@@ -114,11 +113,10 @@ impl Default for AlacEncoder {
     }
 }
 
-/// Encode a complete in-memory PCM buffer using one stateful encoder.
-pub fn encode_all(samples: &PcmSamples) -> Result<Vec<AlacPacket>> {
+/// Encode interleaved 44.1 kHz stereo samples using one stateful encoder.
+pub fn encode_all(interleaved: &[i16]) -> Result<Vec<AlacPacket>> {
     let mut encoder = AlacEncoder::new();
-    samples
-        .interleaved
+    interleaved
         .chunks(SAMPLES_PER_PACKET)
         .map(|chunk| encoder.encode_packet(chunk))
         .collect()
@@ -133,8 +131,13 @@ mod tests {
 
     #[test]
     fn encodes_fixture_with_partial_tail() {
-        let pcm = parse_wav(TONE).expect("parse fixture");
-        let packets = encode_all(&pcm).expect("encode fixture");
+        let audio = parse_wav(TONE).expect("parse fixture");
+        let samples: Vec<i16> = audio
+            .data
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        let packets = encode_all(&samples).expect("encode fixture");
         let counts: Vec<_> = packets.iter().map(|packet| packet.frame_count).collect();
         assert_eq!(counts, [352, 352, 352, 100]);
         assert_eq!(counts.iter().sum::<usize>(), 1156);

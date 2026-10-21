@@ -7,8 +7,8 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use log::warn;
-use openplay::audio::{AudioSource, Frame, PcmSamples, parse_wav};
+use log::{info, warn};
+use openplay::audio::{AudioInput, AudioSource, WavAudio, parse_wav};
 use openplay::cli::{self, CliError, Command};
 use openplay::device::{self, Device, DeviceKind, Features};
 use openplay::info;
@@ -21,9 +21,13 @@ use tokio::time::sleep;
 
 const BROWSE_WAIT: Duration = Duration::from_secs(3);
 const AIRPLAY_PORT: u16 = 7000;
-const FRAMES_PER_PACKET: usize = 352;
-/// About a quarter second of queued audio between the file and the sender.
-const QUEUED_PACKETS: usize = 32;
+/// Half a second of 44.1 kHz audio: the most the source buffers.
+const SOURCE_CAPACITY_FRAMES: usize = 22_050;
+/// The file is fed until about a quarter second is queued, well below
+/// capacity so nothing is dropped.
+const FEED_TARGET_FRAMES: usize = 11_025;
+/// Chunk the file like an audio engine period.
+const FEED_PERIOD: Duration = Duration::from_millis(10);
 const FEED_POLL: Duration = Duration::from_millis(4);
 /// Receiver buffers about two seconds; wait that long after the last packet
 /// before TEARDOWN so the end of the file is still heard.
@@ -123,9 +127,10 @@ async fn run_play(
     bind: Option<Ipv4Addr>,
     volume: Option<u8>,
 ) -> Result<()> {
-    let samples = parse_wav(&fs::read(file)?)?;
+    let audio = parse_wav(&fs::read(file)?)?;
     let addr = resolve(target, bind).await?;
-    let source = AudioSource::new(QUEUED_PACKETS);
+    let source = AudioSource::new(SOURCE_CAPACITY_FRAMES);
+    let input = AudioInput::new(audio.format, source.clone())?;
 
     let mut streaming = match session::start(addr, bind, source.clone()).await {
         Ok(streaming) => streaming,
@@ -148,10 +153,15 @@ async fn run_play(
     let stop = async {
         select! {
             _ = ctrl_c() => {}
-            () = feed(&source, samples) => {}
+            () = feed(input, &source, &audio) => {}
         }
     };
     let outcome = streaming.run_until(stop).await;
+    let stats = source.stats();
+    info!(
+        "underrun {} frames, overrun {} frames",
+        stats.underrun_frames, stats.overrun_frames
+    );
     let teardown = streaming.teardown().await;
     outcome.and(teardown)
 }
@@ -170,16 +180,21 @@ async fn resolve(target: &str, bind: Option<Ipv4Addr>) -> Result<SocketAddr> {
         .ok_or_else(|| Error::Discovery(format!("no receiver named {target}")))
 }
 
-/// Queue the file in packet-sized chunks no faster than the sender drains
-/// them, since a full source drops its oldest audio.
-async fn feed(source: &AudioSource, samples: PcmSamples) {
-    for chunk in samples.interleaved.chunks(FRAMES_PER_PACKET * 2) {
-        while source.len() >= QUEUED_PACKETS {
+/// Feed the file through the same conversion a live driver uses, in engine
+/// sized chunks, no faster than the sender drains them.
+async fn feed(mut input: AudioInput, source: &AudioSource, audio: &WavAudio) {
+    let period_frames =
+        (u128::from(audio.format.sample_rate) * FEED_PERIOD.as_millis() / 1000) as usize;
+    for chunk in audio
+        .data
+        .chunks(period_frames * audio.format.bytes_per_frame())
+    {
+        while source.buffered_frames() >= FEED_TARGET_FRAMES {
             sleep(FEED_POLL).await;
         }
-        source.write(Frame::Pcm(chunk.to_vec()));
+        input.write(chunk);
     }
-    while !source.is_empty() {
+    while source.buffered_frames() > 0 {
         sleep(FEED_POLL).await;
     }
     sleep(PLAYOUT_TAIL).await;

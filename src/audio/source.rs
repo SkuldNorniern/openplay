@@ -1,108 +1,127 @@
-//! Thread-safe buffering between live PCM producers and paced consumers.
+//! Thread-safe buffering between live PCM producers and the paced sender.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// One unit of media data queued between a live source and the pacing task
-/// that drains it. Deliberately minimal today (interleaved PCM only); more
-/// variants (already-encoded audio, eventually video) are added as other
-/// media stream types need to flow through the same queue.
-#[non_exhaustive]
-pub enum Frame {
-    /// Interleaved 16-bit stereo PCM samples: `[L0, R0, L1, R1, ...]`.
-    Pcm(Vec<i16>),
-}
+const CHANNELS: usize = 2;
 
-/// Bounded, thread-safe queue between a live audio source (pushed from any
-/// thread, including a real-time OS audio callback) and the async task that
-/// paces frames out to the ALAC encoder.
+/// Bounded ring of 44.1 kHz stereo `i16` samples between a live producer
+/// (any thread, including a realtime OS audio callback) and the sender,
+/// which takes exactly one packet's worth every 8 ms.
 ///
-/// Cheaply cloneable: clone one handle for the writer side (the audio
-/// callback) and another for the reader side (the pacing task); both refer
-/// to the same underlying queue.
+/// Producers and the sender run on different clocks, so the ring absorbs
+/// jitter and slow drift: when the sender finds too little it plays silence
+/// for the gap, and when the producer runs ahead past `capacity` the oldest
+/// audio is dropped so latency stays bounded.
+///
+/// Cheaply cloneable; all clones share one ring.
 #[derive(Clone)]
 pub struct AudioSource {
-    queue: Arc<Mutex<VecDeque<Frame>>>,
-    capacity: usize,
+    ring: Arc<Mutex<VecDeque<i16>>>,
+    capacity_frames: usize,
+    stats: Arc<Counters>,
 }
 
-/// Whether a write succeeded cleanly or had to evict the oldest buffered
-/// frame to make room.
+/// Whether a write fit, or pushed out older audio to make room.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
     Ok,
     Overrun,
 }
 
+#[derive(Default)]
+struct Counters {
+    underrun_frames: AtomicU64,
+    overrun_frames: AtomicU64,
+}
+
+/// Running totals for diagnostics and UI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceStats {
+    /// Frames of silence the sender had to play because the ring ran dry.
+    pub underrun_frames: u64,
+    /// Frames of audio dropped because the ring was full.
+    pub overrun_frames: u64,
+}
+
 impl AudioSource {
-    /// Create a source with room for at most `capacity` queued frames.
-    /// Callers choose `capacity` based on their driver's typical push size
-    /// and desired buffering depth -- this module has no opinion on that.
-    pub fn new(capacity: usize) -> Self {
+    /// Create a ring holding at most `capacity_frames` stereo frames.
+    pub fn new(capacity_frames: usize) -> Self {
         Self {
-            queue: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
-            capacity,
+            ring: Arc::new(Mutex::new(VecDeque::with_capacity(
+                capacity_frames * CHANNELS,
+            ))),
+            capacity_frames,
+            stats: Arc::default(),
         }
     }
 
-    /// Push one frame. Safe to call from any thread. If the queue is already
-    /// at capacity, the oldest queued frame is dropped to make room.
-    ///
-    /// A zero-capacity source cannot retain a frame, so every write reports
-    /// an overrun and drops the incoming frame. This preserves the hard bound
-    /// rather than silently turning a zero-sized queue into a one-frame queue.
-    pub fn write(&self, frame: Frame) -> WriteOutcome {
-        let mut queue = self.lock_queue();
-        if self.capacity == 0 {
-            return WriteOutcome::Overrun;
+    /// Append interleaved stereo samples. A trailing odd sample is dropped,
+    /// since it cannot form a frame.
+    pub fn write(&self, samples: &[i16]) -> WriteOutcome {
+        let samples = &samples[..samples.len() - samples.len() % CHANNELS];
+        let capacity = self.capacity_frames * CHANNELS;
+        let mut ring = self.lock();
+
+        // Only the newest `capacity` samples of an oversized write can stay.
+        let incoming = &samples[samples.len().saturating_sub(capacity)..];
+        let overflow = (ring.len() + incoming.len()).saturating_sub(capacity);
+        let dropped = overflow + (samples.len() - incoming.len());
+        ring.drain(..overflow);
+        ring.extend(incoming);
+        drop(ring);
+
+        if dropped == 0 {
+            return WriteOutcome::Ok;
         }
-
-        let outcome = if queue.len() == self.capacity {
-            queue.pop_front();
-            WriteOutcome::Overrun
-        } else {
-            WriteOutcome::Ok
-        };
-        queue.push_back(frame);
-        outcome
+        self.stats
+            .overrun_frames
+            .fetch_add((dropped / CHANNELS) as u64, Ordering::Relaxed);
+        WriteOutcome::Overrun
     }
 
-    /// Pop the next queued frame, if any, without blocking.
-    pub fn try_next(&self) -> Option<Frame> {
-        self.lock_queue().pop_front()
+    /// Take exactly `frames` stereo frames, padding with silence when the
+    /// ring holds fewer.
+    pub fn read(&self, frames: usize) -> Vec<i16> {
+        let wanted = frames * CHANNELS;
+        let mut out = Vec::with_capacity(wanted);
+        let mut ring = self.lock();
+        let available = ring.len().min(wanted);
+        out.extend(ring.drain(..available));
+        drop(ring);
+
+        let missing = wanted - available;
+        if missing > 0 {
+            out.resize(wanted, 0);
+            self.stats
+                .underrun_frames
+                .fetch_add((missing / CHANNELS) as u64, Ordering::Relaxed);
+        }
+        out
     }
 
-    /// Pop the next queued PCM frame, or synthesize `frame_count` frames
-    /// (`frame_count * 2` interleaved samples, this crate's fixed stereo
-    /// format) of silence if the queue is empty. Convenience built on
-    /// [`Self::try_next`] for a pacing task that always wants a fixed-size
-    /// chunk every cycle regardless of whether real audio is ready.
-    ///
-    /// A queued frame is returned unchanged even when its length differs from
-    /// `frame_count`: live drivers need not push chunks aligned to the pacing
-    /// task's packet size, and this buffering layer must not re-chunk them.
-    pub fn next_or_silence(&self, frame_count: usize) -> Frame {
-        self.try_next()
-            .unwrap_or_else(|| Frame::Pcm(vec![0; frame_count * 2]))
+    /// Frames currently buffered.
+    pub fn buffered_frames(&self) -> usize {
+        self.lock().len() / CHANNELS
     }
 
-    /// Number of frames currently queued (for diagnostics/tests, not part of
-    /// the steady-state control flow).
-    pub fn len(&self) -> usize {
-        self.lock_queue().len()
+    pub fn capacity_frames(&self) -> usize {
+        self.capacity_frames
     }
 
-    /// Whether no frames are currently queued.
-    pub fn is_empty(&self) -> bool {
-        self.lock_queue().is_empty()
+    pub fn stats(&self) -> SourceStats {
+        SourceStats {
+            underrun_frames: self.stats.underrun_frames.load(Ordering::Relaxed),
+            overrun_frames: self.stats.overrun_frames.load(Ordering::Relaxed),
+        }
     }
 
-    fn lock_queue(&self) -> MutexGuard<'_, VecDeque<Frame>> {
-        // A panic while holding the short queue lock may leave an operation
-        // incomplete, but VecDeque remains memory-safe. Recovering the guard
-        // prevents one producer or consumer panic from permanently wedging
-        // every other handle to a live stream.
-        self.queue
+    fn lock(&self) -> MutexGuard<'_, VecDeque<i16>> {
+        // Only whole drain/extend calls run under the lock, so a panic
+        // elsewhere cannot leave a half-written frame behind. Recovering the
+        // guard keeps one panicking handle from wedging a live stream.
+        self.ring
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -110,111 +129,89 @@ impl AudioSource {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     use super::*;
 
-    fn pcm_samples(frame: Frame) -> Vec<i16> {
-        match frame {
-            Frame::Pcm(samples) => samples,
+    #[test]
+    fn read_returns_written_samples_in_order() {
+        let source = AudioSource::new(4);
+        assert_eq!(source.write(&[1, -1, 2, -2]), WriteOutcome::Ok);
+
+        assert_eq!(source.read(2), [1, -1, 2, -2]);
+        assert_eq!(source.stats(), SourceStats::default());
+    }
+
+    #[test]
+    fn short_ring_pads_with_silence_and_counts_it() {
+        let source = AudioSource::new(4);
+        source.write(&[5, 6]);
+
+        assert_eq!(source.read(3), [5, 6, 0, 0, 0, 0]);
+        assert_eq!(source.stats().underrun_frames, 2);
+    }
+
+    #[test]
+    fn reads_are_exact_regardless_of_write_sizes() {
+        let source = AudioSource::new(1_000);
+        for chunk in [480_usize, 7, 1, 352] {
+            source.write(&vec![1; chunk * 2]);
         }
+
+        assert_eq!(source.read(352).len(), 704);
+        assert_eq!(source.buffered_frames(), 840 - 352);
     }
 
     #[test]
-    fn write_and_read_round_trip() {
+    fn full_ring_drops_oldest_frames() {
         let source = AudioSource::new(2);
+        source.write(&[1, 1, 2, 2]);
 
-        assert_eq!(
-            source.write(Frame::Pcm(vec![1, -2, 3, -4])),
-            WriteOutcome::Ok
-        );
-        assert_eq!(
-            pcm_samples(source.try_next().expect("queued frame")),
-            [1, -2, 3, -4]
-        );
-        assert!(source.try_next().is_none());
+        assert_eq!(source.write(&[3, 3]), WriteOutcome::Overrun);
+        assert_eq!(source.read(2), [2, 2, 3, 3]);
+        assert_eq!(source.stats().overrun_frames, 1);
     }
 
     #[test]
-    fn overrun_evicts_the_oldest_frame() {
+    fn oversized_write_keeps_its_newest_frames() {
         let source = AudioSource::new(2);
+        source.write(&[9, 9]);
 
-        assert_eq!(source.write(Frame::Pcm(vec![1])), WriteOutcome::Ok);
-        assert_eq!(source.write(Frame::Pcm(vec![2])), WriteOutcome::Ok);
-        assert_eq!(source.write(Frame::Pcm(vec![3])), WriteOutcome::Overrun);
-
-        assert_eq!(pcm_samples(source.try_next().expect("second frame")), [2]);
-        assert_eq!(pcm_samples(source.try_next().expect("third frame")), [3]);
-        assert!(source.try_next().is_none());
+        assert_eq!(source.write(&[1, 1, 2, 2, 3, 3]), WriteOutcome::Overrun);
+        assert_eq!(source.read(2), [2, 2, 3, 3]);
+        assert_eq!(source.stats().overrun_frames, 2);
     }
 
     #[test]
-    fn underrun_returns_exactly_the_requested_silence() {
-        let source = AudioSource::new(1);
-
-        let samples = pcm_samples(source.next_or_silence(352));
-        assert_eq!(samples.len(), 704);
-        assert!(samples.iter().all(|sample| *sample == 0));
+    fn odd_trailing_sample_is_dropped() {
+        let source = AudioSource::new(4);
+        source.write(&[1, 2, 3]);
+        assert_eq!(source.buffered_frames(), 1);
     }
 
     #[test]
-    fn next_or_silence_prefers_an_unaligned_real_frame() {
-        let source = AudioSource::new(1);
-        assert_eq!(
-            source.write(Frame::Pcm(vec![7, 8, 9, 10, 11, 12])),
-            WriteOutcome::Ok
-        );
-
-        assert_eq!(
-            pcm_samples(source.next_or_silence(352)),
-            [7, 8, 9, 10, 11, 12]
-        );
+    fn zero_capacity_drops_everything() {
+        let source = AudioSource::new(0);
+        assert_eq!(source.write(&[1, 2]), WriteOutcome::Overrun);
+        assert_eq!(source.read(1), [0, 0]);
     }
 
     #[test]
-    fn concurrent_writers_and_reader_complete() {
-        let source = AudioSource::new(4_096);
-        let writers_done = Arc::new(AtomicBool::new(false));
-        let reader_source = source.clone();
-        let reader_done = Arc::clone(&writers_done);
-        let reader = thread::spawn(move || {
-            while !reader_done.load(Ordering::Acquire) || !reader_source.is_empty() {
-                let _frame = reader_source.try_next();
-                thread::yield_now();
+    fn concurrent_writer_and_reader_keep_frames_whole() {
+        let source = AudioSource::new(256);
+        let writer_source = source.clone();
+        let writer = thread::spawn(move || {
+            for value in 0..2_000_i16 {
+                writer_source.write(&[value, value]);
             }
         });
-
-        let writers: Vec<_> = (0..4)
-            .map(|writer| {
-                let writer_source = source.clone();
-                thread::spawn(move || {
-                    for sample in 0..1_000 {
-                        let _outcome = writer_source.write(Frame::Pcm(vec![writer, sample]));
-                    }
-                })
-            })
-            .collect();
-
-        for writer in writers {
-            writer.join().expect("writer completes");
+        let mut seen = Vec::new();
+        while !writer.is_finished() || source.buffered_frames() > 0 {
+            seen.extend(source.read(16));
+            thread::yield_now();
         }
-        writers_done.store(true, Ordering::Release);
-        reader.join().expect("reader completes");
-    }
+        writer.join().expect("writer completes");
 
-    #[test]
-    fn length_and_empty_state_follow_queue_contents() {
-        let source = AudioSource::new(2);
-        assert!(source.is_empty());
-        assert_eq!(source.len(), 0);
-
-        assert_eq!(source.write(Frame::Pcm(vec![1, 2])), WriteOutcome::Ok);
-        assert!(!source.is_empty());
-        assert_eq!(source.len(), 1);
-
-        let _frame = source.try_next().expect("queued frame");
-        assert!(source.is_empty());
-        assert_eq!(source.len(), 0);
+        assert!(seen.chunks(2).all(|frame| frame[0] == frame[1]));
     }
 }

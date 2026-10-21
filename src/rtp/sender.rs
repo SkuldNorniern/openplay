@@ -8,7 +8,7 @@ use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::interval;
 
-use crate::audio::{AlacEncoder, AudioSource, Frame};
+use crate::audio::{AlacEncoder, AudioSource};
 use crate::error::{Error, Result};
 
 use super::{PacketHistory, RtpPacketBuilder, SyncSender};
@@ -77,13 +77,10 @@ impl RtpSender {
     /// Pull, encode, encrypt, and transmit exactly one audio packet.
     ///
     /// Returns the actual number of PCM frames represented by the packet.
-    #[allow(clippy::infallible_destructuring_match)]
     pub async fn send_one(&mut self) -> Result<usize> {
-        // Keep this as a match so another Frame variant cannot be routed into
-        // the ALAC encoder accidentally when the audio source grows.
-        let samples = match self.source.next_or_silence(FRAMES_PER_PACKET) {
-            Frame::Pcm(samples) => samples,
-        };
+        // Always a full packet, padded with silence when the source is short,
+        // so RTP timestamps advance by a constant 352 frames.
+        let samples = self.source.read(FRAMES_PER_PACKET);
         let alac_packet = self.encoder.encode_packet(&samples)?;
         let frame_count = alac_packet.frame_count;
         let marker = !self.first_packet_sent;
@@ -286,13 +283,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_one_consumes_a_queued_partial_pcm_frame() {
-        let source = AudioSource::new(1);
-        assert_eq!(source.write(Frame::Pcm(vec![7; 50 * 2])), WriteOutcome::Ok);
-        let (peer, mut sender, _) = peer_and_sender(source).await;
+    async fn short_source_still_sends_a_full_packet() {
+        let source = AudioSource::new(FRAMES_PER_PACKET);
+        assert_eq!(source.write(&[7; 50 * 2]), WriteOutcome::Ok);
+        let (peer, mut sender, _) = peer_and_sender(source.clone()).await;
 
-        assert_eq!(sender.send_one().await.expect("send real PCM packet"), 50);
+        assert_eq!(
+            sender.send_one().await.expect("send padded packet"),
+            FRAMES_PER_PACKET
+        );
         let _packet = receive_packet(&peer).await;
+        assert_eq!(source.stats().underrun_frames, 302);
     }
 
     #[tokio::test(flavor = "multi_thread")]
