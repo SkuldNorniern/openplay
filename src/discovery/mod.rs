@@ -89,7 +89,8 @@ impl Aggregator {
             match rr {
                 Rr::Ptr { name, target } => self.ptr.push((name, target)),
                 Rr::Srv { name, port, target } => {
-                    self.srv.insert(name, (port, target));
+                    // mDNS names compare case-insensitively.
+                    self.srv.insert(name, (port, target.to_ascii_lowercase()));
                 }
                 Rr::Txt { name, pairs } => {
                     self.txt.insert(name, pairs);
@@ -101,7 +102,7 @@ impl Aggregator {
     }
 
     fn add_addr(&mut self, host: String, addr: IpAddr) {
-        let list = self.addrs.entry(host).or_default();
+        let list = self.addrs.entry(host.to_ascii_lowercase()).or_default();
         // Repeated responses re-announce the same addresses; keep them unique.
         if !list.contains(&addr) {
             list.push(addr);
@@ -182,6 +183,27 @@ mod tests {
     }
 
     #[test]
+    fn host_names_match_regardless_of_case() {
+        let mut agg = Aggregator::default();
+        agg.ingest(vec![
+            Rr::Srv {
+                name: "Speaker._airplay._tcp.local".into(),
+                port: 7000,
+                target: "Speaker.local".into(),
+            },
+            Rr::A {
+                name: "speaker.local".into(),
+                addr: Ipv4Addr::new(192, 0, 2, 20),
+            },
+        ]);
+        let recs = agg.finish(&[SERVICE_AIRPLAY]);
+        assert_eq!(
+            recs[0].addrs,
+            vec![IpAddr::from(Ipv4Addr::new(192, 0, 2, 20))]
+        );
+    }
+
+    #[test]
     fn rejects_suffix_without_label_boundary() {
         let mut agg = Aggregator::default();
         agg.ingest(vec![Rr::Srv {
@@ -201,6 +223,6 @@ mod tests {
         };
         agg.ingest(vec![a.clone()]);
         agg.ingest(vec![a]);
-        assert_eq!(agg.addrs.get("Speaker.local").map(Vec::len), Some(1));
+        assert_eq!(agg.addrs.get("speaker.local").map(Vec::len), Some(1));
     }
 }
