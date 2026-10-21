@@ -15,6 +15,14 @@ pub enum Command {
     /// Stream a WAV file, or raw PCM from stdin when `file` is `-`, to a
     /// receiver (name or IP).
     Play { target: String, file: PathBuf },
+    /// Stream what this PC plays (Windows loopback capture).
+    Loopback {
+        target: String,
+        /// Render device name to capture; the default output when unset.
+        device: Option<String>,
+    },
+    /// List output devices that loopback can capture.
+    Devices,
 }
 
 /// Parsed command line.
@@ -47,8 +55,10 @@ pub fn usage() -> &'static str {
      usage:\n\
      \x20 openplay --discover [--iface <ip>]\n\
      \x20 openplay --info <target> [--iface <ip>]\n\
+     \x20 openplay --devices\n\
      \x20 openplay <target> <file.wav> [--iface <ip>] [--volume <0-100>] [--buffered]\n\
      \x20 openplay <target> - [--rate <hz>] [--channels <n>] [--sample <s16|s24|s32|f32>]\n\
+     \x20 openplay <target> --loopback [--device <name>]\n\
      \n\
      options:\n\
      \x20 -i, --iface <ip>  bind to this local IPv4 (LAN interface)\n\
@@ -57,6 +67,8 @@ pub fn usage() -> &'static str {
      \x20 --rate <hz>       stdin sample rate (default 44100)\n\
      \x20 --channels <n>    stdin channel count (default 2)\n\
      \x20 --sample <type>   stdin sample type: s16, s24, s32 or f32 (default s16)\n\
+     \x20 --loopback        stream what this PC plays (Windows)\n\
+     \x20 --device <name>   output device to capture, by part of its name\n\
      \x20 -v, --verbose     more log detail\n\
      \x20 -h, --help        show this help\n\
      \n\
@@ -71,8 +83,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     let mut buffered = false;
     let mut pcm = PcmFormat::AIRPLAY;
     let mut verbose = false;
-    let mut discover = false;
-    let mut info = None;
+    let mut selected = Selected::default();
     let mut positionals: Vec<String> = Vec::new();
     let mut opts_done = false;
 
@@ -86,7 +97,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
             "--" => opts_done = true,
             "-h" | "--help" => return Err(CliError::Help),
             "-v" | "--verbose" => verbose = true,
-            "--discover" => discover = true,
+            "--discover" => selected.discover = true,
+            "--devices" => selected.devices = true,
+            "--loopback" => selected.loopback = true,
+            "--device" => selected.device = Some(it.next().ok_or(CliError::Usage)?),
             "--buffered" => buffered = true,
             "--rate" => pcm.sample_rate = parse_value(it.next())?,
             "--channels" => pcm.channels = parse_value(it.next())?,
@@ -99,7 +113,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
                     _ => return Err(CliError::Usage),
                 }
             }
-            "--info" => info = Some(it.next().ok_or(CliError::Usage)?),
+            "--info" => selected.info = Some(it.next().ok_or(CliError::Usage)?),
             "-i" | "--iface" => {
                 let val = it.next().ok_or(CliError::Usage)?;
                 let ip = val.parse::<Ipv4Addr>().map_err(|_| CliError::Usage)?;
@@ -121,7 +135,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     }
 
     pcm.validate().map_err(|_| CliError::Usage)?;
-    let command = build_command(discover, info, positionals)?;
+    let command = build_command(selected, positionals)?;
     Ok(Cli {
         command,
         bind,
@@ -139,25 +153,59 @@ fn parse_value<T: FromStr>(value: Option<String>) -> Result<T, CliError> {
         .map_err(|_| CliError::Usage)
 }
 
-fn build_command(
+/// Options that pick the command.
+#[derive(Default)]
+struct Selected {
     discover: bool,
     info: Option<String>,
-    positionals: Vec<String>,
-) -> Result<Command, CliError> {
-    if let Some(target) = info {
-        if discover || !positionals.is_empty() {
-            return Err(CliError::Usage);
-        }
-        return Ok(Command::Info { target });
+    devices: bool,
+    loopback: bool,
+    device: Option<String>,
+}
+
+fn build_command(selected: Selected, positionals: Vec<String>) -> Result<Command, CliError> {
+    let modes = [
+        selected.discover,
+        selected.info.is_some(),
+        selected.devices,
+        selected.loopback,
+    ];
+    if modes.iter().filter(|mode| **mode).count() > 1
+        || (selected.device.is_some() && !selected.loopback)
+    {
+        return Err(CliError::Usage);
     }
-    if discover {
-        if !positionals.is_empty() {
-            return Err(CliError::Usage);
-        }
-        return Ok(Command::Discover);
-    }
-    match positionals.as_slice() {
-        [target, file] => Ok(Command::Play {
+
+    match (selected, positionals.as_slice()) {
+        (Selected { discover: true, .. }, []) => Ok(Command::Discover),
+        (Selected { devices: true, .. }, []) => Ok(Command::Devices),
+        (
+            Selected {
+                info: Some(target), ..
+            },
+            [],
+        ) => Ok(Command::Info { target }),
+        (
+            Selected {
+                loopback: true,
+                device,
+                ..
+            },
+            [target],
+        ) => Ok(Command::Loopback {
+            target: target.clone(),
+            device,
+        }),
+        (
+            Selected {
+                discover: false,
+                info: None,
+                devices: false,
+                loopback: false,
+                ..
+            },
+            [target, file],
+        ) => Ok(Command::Play {
             target: target.clone(),
             file: PathBuf::from(file),
         }),
@@ -236,6 +284,33 @@ mod tests {
             &["Speaker", "-", "--rate", "fast"],
             &["Speaker", "-", "--channels", "0"],
             &["Speaker", "-", "--rate"],
+        ] {
+            assert!(matches!(
+                parse(bad.iter().map(|s| s.to_string())),
+                Err(CliError::Usage)
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_loopback_and_devices() {
+        match parse_ok(&["Speaker", "--loopback", "--device", "CABLE"]).command {
+            Command::Loopback { target, device } => {
+                assert_eq!(target, "Speaker");
+                assert_eq!(device.as_deref(), Some("CABLE"));
+            }
+            _ => panic!("expected loopback"),
+        }
+        assert!(matches!(
+            parse_ok(&["Speaker", "--loopback"]).command,
+            Command::Loopback { device: None, .. }
+        ));
+        assert!(matches!(parse_ok(&["--devices"]).command, Command::Devices));
+        for bad in [
+            &["Speaker", "song.wav", "--loopback"][..],
+            &["Speaker", "song.wav", "--device", "x"],
+            &["--devices", "--discover"],
+            &["--loopback"],
         ] {
             assert!(matches!(
                 parse(bad.iter().map(|s| s.to_string())),

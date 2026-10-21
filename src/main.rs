@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use log::info;
 use openplay::audio::{AudioInput, PcmFormat, WavAudio, parse_wav};
+use openplay::capture::{self, CAPTURE_FORMAT, Loopback};
 use openplay::cli::{self, CliError, Command};
 use openplay::device::{self, Device, DeviceKind, Features};
 use openplay::info;
@@ -36,6 +37,8 @@ const PLAYOUT_TAIL: Duration = Duration::from_secs(2);
 /// A receiver now and then rejects stream SETUP when its clock exchange
 /// has not started yet; one fresh session usually works.
 const PLAY_RETRIES: u32 = 1;
+/// How often loopback mode checks that capture is still running.
+const CAPTURE_CHECK: Duration = Duration::from_millis(500);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -60,6 +63,17 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Discover => run_discover(cli.bind).await,
         Command::Info { target } => run_info(&target, cli.bind).await,
+        Command::Devices => run_devices(),
+        Command::Loopback { target, device } => {
+            run_loopback(
+                &target,
+                device.as_deref(),
+                cli.bind,
+                cli.volume,
+                cli.buffered,
+            )
+            .await
+        }
         Command::Play { target, file } => {
             let feed = if file == Path::new("-") {
                 Ok(Feed::Stdin(cli.pcm))
@@ -156,35 +170,14 @@ async fn run_play(
         Feed::File(audio) => (audio.format, false, "file"),
         Feed::Stdin(format) => (*format, true, "stdin"),
     };
-    let config = SenderConfig {
-        bind,
-        mode: if buffered {
-            StreamMode::Buffered
-        } else {
-            StreamMode::Realtime
-        },
-        volume,
-        // A file is fed at the sender's pace; only live input has its own
-        // clock to follow.
-        drift_correction: live,
-        // A live source should outlast receiver hiccups; a file run fails
-        // fast instead.
-        max_retries: if live { None } else { Some(PLAY_RETRIES) },
-        ..SenderConfig::default()
-    };
+    let config = sender_config(bind, volume, buffered, live);
     let (sender, input) = Sender::start(addr, format, config)?;
     let logger = spawn(log_status(sender.status(), name));
 
-    let mut status = sender.status();
     let outcome = select! {
         _ = ctrl_c() => Ok(()),
         fed = feed_input(input, &sender, feed) => fed,
-        failed = status.wait_for(|status| matches!(status, Status::Failed { .. })) => {
-            match failed.map(|status| status.clone()) {
-                Ok(Status::Failed { error }) => Err(Error::Session(error)),
-                _ => Ok(()),
-            }
-        }
+        failed = wait_for_failure(&sender) => failed,
     };
     let stats = sender.stats();
     info!(
@@ -238,6 +231,96 @@ async fn drain(sender: &Sender, wait_for_session: bool) {
     }
     if matches!(*sender.status().borrow(), Status::Streaming { .. }) {
         sleep(PLAYOUT_TAIL).await;
+    }
+}
+
+/// Settings for a CLI run. Live input follows its source's clock and
+/// outlasts receiver hiccups; a file is fed at the sender's pace and fails
+/// fast instead.
+fn sender_config(
+    bind: Option<Ipv4Addr>,
+    volume: Option<u8>,
+    buffered: bool,
+    live: bool,
+) -> SenderConfig {
+    SenderConfig {
+        bind,
+        mode: if buffered {
+            StreamMode::Buffered
+        } else {
+            StreamMode::Realtime
+        },
+        volume,
+        drift_correction: live,
+        max_retries: if live { None } else { Some(PLAY_RETRIES) },
+        ..SenderConfig::default()
+    }
+}
+
+/// Resolve once the sender gives up, with its last error.
+async fn wait_for_failure(sender: &Sender) -> Result<()> {
+    let mut status = sender.status();
+    let failed = status
+        .wait_for(|status| matches!(status, Status::Failed { .. }))
+        .await
+        .map(|status| status.clone());
+    match failed {
+        Ok(Status::Failed { error }) => Err(Error::Session(error)),
+        _ => Ok(()),
+    }
+}
+
+fn run_devices() -> Result<()> {
+    for (index, name) in capture::render_devices()?.iter().enumerate() {
+        let default = if index == 0 { " (default)" } else { "" };
+        println!("{name}{default}");
+    }
+    Ok(())
+}
+
+/// Stream what the PC plays until ctrl-c.
+async fn run_loopback(
+    target: &str,
+    device: Option<&str>,
+    bind: Option<Ipv4Addr>,
+    volume: Option<u8>,
+    buffered: bool,
+) -> Result<()> {
+    // Fails fast where capture is unsupported, before any connection.
+    capture::render_devices()?;
+    let addr = resolve(target, bind).await?;
+    let config = sender_config(bind, volume, buffered, true);
+    let (sender, input) = Sender::start(addr, CAPTURE_FORMAT, config)?;
+    let capture = match Loopback::start(device, input) {
+        Ok(capture) => capture,
+        Err(error) => {
+            sender.stop().await;
+            return Err(error);
+        }
+    };
+    info!("capturing {}", capture.device());
+    let logger = spawn(log_status(sender.status(), "system audio"));
+
+    let outcome = select! {
+        _ = ctrl_c() => Ok(()),
+        failed = wait_for_failure(&sender) => failed,
+        () = wait_while(|| capture.is_running()) => {
+            Err(Error::Audio("capture stopped".to_owned()))
+        }
+    };
+    // The thread's own error explains a stopped capture better.
+    let outcome = match (outcome, capture.stop()) {
+        (Err(Error::Audio(_)), Err(capture_error)) => Err(capture_error),
+        (outcome, _) => outcome,
+    };
+    sender.stop().await;
+    logger.abort();
+    outcome
+}
+
+async fn wait_while(condition: impl Fn() -> bool) {
+    while condition() {
+        sleep(CAPTURE_CHECK).await;
     }
 }
 
