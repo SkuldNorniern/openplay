@@ -185,6 +185,27 @@ pub fn parse_stream_setup_response(body: &[u8]) -> Result<StreamSetupResponse> {
     })
 }
 
+/// Lowest volume AirPlay plays at; anything quieter is mute.
+pub const MIN_VOLUME_DB: f32 = -30.0;
+/// AirPlay's value for mute.
+pub const MUTE_DB: f32 = -144.0;
+
+/// Map a 0 to 100 volume to AirPlay decibels: 0 mutes, 1 to 100 spread
+/// linearly over -30 dB to 0 dB, as the receiver's own volume steps are.
+pub fn volume_db(percent: u8) -> f32 {
+    match percent.min(100) {
+        0 => MUTE_DB,
+        level => MIN_VOLUME_DB * (1.0 - f32::from(level) / 100.0),
+    }
+}
+
+/// Build the SET_PARAMETER request that sets playback volume.
+pub fn volume_request(session: &SessionId, volume_db: f32) -> Request {
+    Request::new("SET_PARAMETER", &session.path())
+        .header("Content-Type", "text/parameters")
+        .body(format!("volume: {volume_db:.6}\r\n").into_bytes())
+}
+
 /// Build the RECORD request.
 ///
 /// Callers must send this immediately before starting audio. An unbounded gap
@@ -389,6 +410,24 @@ mod tests {
             out_of_range.insert("eventPort".into(), Value::from(invalid));
             assert!(parse_session_setup_response(&plist_body(out_of_range)).is_err());
         }
+    }
+
+    #[test]
+    fn volume_maps_percent_to_decibels() {
+        assert_eq!(volume_db(0), MUTE_DB);
+        assert_eq!(volume_db(1), -29.7);
+        assert_eq!(volume_db(50), -15.0);
+        assert_eq!(volume_db(100), 0.0);
+        assert_eq!(volume_db(200), 0.0);
+    }
+
+    #[test]
+    fn builds_volume_request() {
+        let request = volume_request(&fixed_session(), -15.0);
+
+        assert_eq!(request.method, "SET_PARAMETER");
+        assert_eq!(request.headers.get("Content-Type"), Some("text/parameters"));
+        assert_eq!(request.body, b"volume: -15.000000\r\n");
     }
 
     #[test]
