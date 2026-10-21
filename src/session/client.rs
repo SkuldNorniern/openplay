@@ -21,6 +21,8 @@ pub const USER_AGENT: &str = "AirPlay/745.83";
 const CLIENT_NAME: &str = "openplay";
 /// A receiver that never answers is treated as failed rather than waited on.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A receiver that stops reading must not stall a request forever.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Sender identity sent on every request. Keeping it across reconnects,
 /// and across runs once stored, lets the receiver see one device.
@@ -69,10 +71,16 @@ impl Identity {
 
 /// Sends RTSP requests with an increasing CSeq and the sender identity
 /// headers, and waits for each response in turn.
+///
+/// After a timeout or transport error the connection's position in the
+/// stream is unknown: a late reply may still arrive, or an encrypted frame
+/// may be half read. The client is then broken and refuses further
+/// requests rather than mistaking stale bytes for a new reply.
 pub struct RtspClient<S> {
     transport: ControlTransport<S>,
     identity: Identity,
     cseq: u32,
+    broken: bool,
 }
 
 impl<S> RtspClient<S>
@@ -84,7 +92,13 @@ where
             transport: ControlTransport::new(stream),
             identity,
             cseq: 0,
+            broken: false,
         }
+    }
+
+    /// Whether a timeout or transport error has made the connection unusable.
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// Switch the connection to the encrypted record layer after pairing.
@@ -94,16 +108,44 @@ where
 
     /// Send `request` and return its response, failing on a non-2xx status.
     pub async fn request(&mut self, request: Request) -> Result<Response> {
+        if self.broken {
+            return Err(Error::Rtsp(format!(
+                "{} {}: control connection is broken",
+                request.method, request.uri
+            )));
+        }
         self.cseq += 1;
+        let cseq = self.cseq.to_string();
         let request = self.with_common_headers(request);
         let method = request.method.clone();
         let uri = request.uri.clone();
-        debug!("rtsp >> {method} {uri} cseq={}", self.cseq);
-        self.transport.send(&request).await?;
+        debug!("rtsp >> {method} {uri} cseq={cseq}");
 
-        let response = timeout(RESPONSE_TIMEOUT, self.transport.receive())
-            .await
-            .map_err(|_| Error::Rtsp(format!("{method} {uri}: no response")))??;
+        let sent = timeout(SEND_TIMEOUT, self.transport.send(&request)).await;
+        let sent =
+            sent.unwrap_or_else(|_| Err(Error::Rtsp(format!("{method} {uri}: send timed out"))));
+        if let Err(error) = sent {
+            self.broken = true;
+            return Err(error);
+        }
+        let received = timeout(RESPONSE_TIMEOUT, self.transport.receive()).await;
+        let received =
+            received.unwrap_or_else(|_| Err(Error::Rtsp(format!("{method} {uri}: no response"))));
+        let response = match received {
+            Ok(response) => response,
+            Err(error) => {
+                self.broken = true;
+                return Err(error);
+            }
+        };
+        if let Some(reply_cseq) = response.headers.get("CSeq")
+            && reply_cseq.trim() != cseq
+        {
+            self.broken = true;
+            return Err(Error::Rtsp(format!(
+                "{method} {uri}: reply for CSeq {reply_cseq}, expected {cseq}"
+            )));
+        }
         debug!(
             "rtsp << {} {} ({} byte body)",
             response.status,
@@ -156,6 +198,7 @@ fn log_response_details(response: &Response) {
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
     use tokio::spawn;
+    use tokio::time::sleep;
 
     use super::*;
 
@@ -213,6 +256,71 @@ mod tests {
     fn identity_round_trips_through_device_id() {
         let identity = Identity::generate();
         assert_eq!(Identity::from_device_id(identity.device_id()), identity);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_breaks_client_and_stale_reply_is_never_taken() {
+        let (sender, mut receiver) = duplex(4096);
+        let mut client = RtspClient::new(sender, IDENTITY);
+        let late = spawn(async move {
+            let _request = read_request(&mut receiver).await;
+            sleep(RESPONSE_TIMEOUT * 2).await;
+            receiver
+                .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")
+                .await
+                .expect("write late reply");
+            receiver
+        });
+
+        let error = client
+            .request(Request::new("SETUP", "/1"))
+            .await
+            .expect_err("times out");
+        assert!(error.to_string().contains("no response"));
+        assert!(client.is_broken());
+        let _receiver = late.await.expect("late reply written");
+
+        let error = client
+            .request(Request::new("TEARDOWN", "/1"))
+            .await
+            .expect_err("broken client refuses");
+        assert!(error.to_string().contains("broken"));
+    }
+
+    #[tokio::test]
+    async fn mismatched_cseq_is_rejected() {
+        let (sender, mut receiver) = duplex(4096);
+        let mut client = RtspClient::new(sender, IDENTITY);
+        spawn(async move {
+            let _request = read_request(&mut receiver).await;
+            receiver
+                .write_all(b"RTSP/1.0 200 OK\r\nCSeq: 7\r\n\r\n")
+                .await
+                .expect("write reply");
+        });
+
+        let error = client
+            .request(Request::new("GET", "/info"))
+            .await
+            .expect_err("wrong cseq");
+        assert!(error.to_string().contains("CSeq 7"));
+        assert!(client.is_broken());
+    }
+
+    #[tokio::test]
+    async fn error_status_leaves_client_usable() {
+        let (sender, mut receiver) = duplex(4096);
+        let mut client = RtspClient::new(sender, IDENTITY);
+        spawn(async move {
+            let _request = read_request(&mut receiver).await;
+            receiver
+                .write_all(b"RTSP/1.0 400 Bad Request\r\nCSeq: 1\r\n\r\n")
+                .await
+                .expect("write reply");
+        });
+
+        assert!(client.request(Request::new("SETUP", "/1")).await.is_err());
+        assert!(!client.is_broken());
     }
 
     #[tokio::test]
