@@ -4,6 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpSocket, TcpStream};
+use tokio::time::timeout;
+
+use super::stream::CONNECT_TIMEOUT;
 
 use crate::error::{Error, Result};
 
@@ -36,7 +39,9 @@ impl EventChannel {
             socket.bind(SocketAddr::from((ip, 0)))?;
         }
 
-        let stream = socket.connect(target).await?;
+        let stream = timeout(CONNECT_TIMEOUT, socket.connect(target))
+            .await
+            .map_err(|_| Error::Rtsp(format!("event channel connect to {target} timed out")))??;
         Ok(Self { stream })
     }
 

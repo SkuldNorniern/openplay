@@ -44,6 +44,9 @@ use super::{
 };
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
+/// A receiver that drops off the network leaves connects unanswered; the
+/// OS would retry for minutes.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a buffered session waits for its PTP follower to lock on.
 const PTP_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 const PTP_SYNC_POLL: Duration = Duration::from_millis(20);
@@ -522,6 +525,12 @@ impl Streaming {
         self.receiver_latency_frames
     }
 
+    /// Whether the control connection can still carry requests. After a
+    /// timeout or transport error it cannot, and TEARDOWN would not arrive.
+    pub fn is_control_healthy(&self) -> bool {
+        !self.client.is_broken()
+    }
+
     /// Set playback volume, 0 (mute) to 100.
     pub async fn set_volume(&mut self, percent: u8) -> Result<()> {
         self.client
@@ -595,7 +604,10 @@ async fn connect_tcp(addr: SocketAddr, bind: Option<Ipv4Addr>) -> Result<TcpStre
         }
         socket.bind(SocketAddr::from((ip, 0)))?;
     }
-    Ok(socket.connect(addr).await?)
+    timeout(CONNECT_TIMEOUT, socket.connect(addr))
+        .await
+        .map_err(|_| Error::Rtsp(format!("connect to {addr} timed out")))?
+        .map_err(Error::from)
 }
 
 #[cfg(test)]
