@@ -15,6 +15,8 @@ use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
 
+use super::is_transient;
+
 /// About four seconds of packets at 352 frames per packet, longer than the
 /// receiver's two-second buffer, so any packet it can still use is kept.
 pub const HISTORY_PACKETS: usize = 512;
@@ -26,7 +28,9 @@ const RESEND_REPLY_TYPE: u8 = 0xd6;
 const RESEND_REQUEST_LEN: usize = 8;
 /// A request for more than this is malformed or hostile; real gaps are short.
 const MAX_RESEND_COUNT: u16 = HISTORY_PACKETS as u16;
-const RECEIVE_BUFFER_LEN: usize = 64;
+/// Room for any datagram a LAN peer sends, so Windows never fails a
+/// receive as oversized.
+const RECEIVE_BUFFER_LEN: usize = 2_048;
 
 /// Sent packets in send order, each with its RTP sequence number.
 type SentPackets = VecDeque<(u16, Vec<u8>)>;
@@ -153,7 +157,14 @@ impl ResendResponder {
     /// the history are left for the receiver to conceal.
     pub async fn respond_once(&self) -> Result<usize> {
         let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
-        let (length, peer) = self.socket.recv_from(&mut buffer).await?;
+        let (length, peer) = match self.socket.recv_from(&mut buffer).await {
+            Ok(received) => received,
+            Err(error) if is_transient(&error) => {
+                debug!("resend: receive failed, continuing: {error}");
+                return Ok(0);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if peer.ip() != self.receiver_ip {
             debug!("resend: ignored datagram from {peer}");
             return Ok(0);
@@ -169,10 +180,17 @@ impl ResendResponder {
         let mut resent = 0;
         for sequence in request.sequences() {
             if let Some(packet) = self.history.get(sequence) {
-                self.socket
+                match self
+                    .socket
                     .send_to(&build_resend_reply(sequence, &packet), peer)
-                    .await?;
-                resent += 1;
+                    .await
+                {
+                    Ok(_) => resent += 1,
+                    Err(error) if is_transient(&error) => {
+                        debug!("resend: send failed, continuing: {error}");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         debug!(

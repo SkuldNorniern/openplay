@@ -4,6 +4,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use log::warn;
 use rand::random;
 use tokio::net::UdpSocket;
 use tokio::time::interval;
@@ -11,9 +12,13 @@ use tokio::time::interval;
 use crate::audio::{AlacEncoder, AudioSource};
 use crate::error::{Error, Result};
 
-use super::{PacketHistory, RtpPacketBuilder, SyncSender};
+use super::{PacketHistory, RtpPacketBuilder, SyncSender, is_transient};
 
 const FRAMES_PER_PACKET: usize = 352;
+/// Delay beyond which the sender stops catching up missed packets.
+const MAX_CATCH_UP: Duration = Duration::from_millis(500);
+/// While sends keep failing, log one in this many (about once a second).
+const FAILURE_LOG_EVERY: u64 = 125;
 const SAMPLE_RATE: f64 = 44_100.0;
 
 /// Sends realtime ALAC audio to an AirPlay receiver over UDP, pulling PCM
@@ -31,6 +36,7 @@ pub struct RtpSender {
     /// still carry the marker, since a failed send never reached the
     /// receiver at all.
     first_packet_sent: bool,
+    failed_sends: u64,
     sync: Option<SyncSender>,
     history: Option<PacketHistory>,
 }
@@ -56,6 +62,7 @@ impl RtpSender {
             encoder: AlacEncoder::new(),
             packet_builder: RtpPacketBuilder::new(random(), audio_key),
             first_packet_sent: false,
+            failed_sends: 0,
             sync: None,
             history: None,
         }
@@ -91,16 +98,27 @@ impl RtpSender {
         let packet =
             self.packet_builder
                 .build_packet(&alac_packet.data, frame_count as u32, marker)?;
-        let sent = self.socket.send_to(&packet, self.receiver_addr).await?;
-        if sent != packet.len() {
-            return Err(Error::Protocol(format!(
-                "rtp: sent {sent} of {} UDP packet bytes",
-                packet.len()
-            )));
+        let sequence = u16::from_be_bytes([packet[2], packet[3]]);
+        match self.socket.send_to(&packet, self.receiver_addr).await {
+            Ok(sent) if sent == packet.len() => self.first_packet_sent = true,
+            Ok(sent) => {
+                return Err(Error::Protocol(format!(
+                    "rtp: sent {sent} of {} UDP packet bytes",
+                    packet.len()
+                )));
+            }
+            // A network blip loses this packet like any dropped datagram;
+            // the receiver can still ask for it from the history.
+            Err(error) if is_transient(&error) => {
+                if self.failed_sends.is_multiple_of(FAILURE_LOG_EVERY) {
+                    warn!("rtp: send failed, continuing: {error}");
+                }
+                self.failed_sends += 1;
+            }
+            Err(error) => return Err(error.into()),
         }
-        self.first_packet_sent = true;
         if let Some(history) = &self.history {
-            history.push(u16::from_be_bytes([packet[2], packet[3]]), packet);
+            history.push(sequence, packet);
         }
 
         Ok(frame_count)
@@ -115,9 +133,18 @@ impl RtpSender {
         let packet_interval = Duration::from_secs_f64(FRAMES_PER_PACKET as f64 / SAMPLE_RATE);
         let mut ticker = interval(packet_interval);
         loop {
-            ticker.tick().await;
-            // Keep Tokio's default Burst behavior: missed ticks catch up to
-            // the original schedule instead of accumulating timing drift.
+            let scheduled = ticker.tick().await;
+            // Tokio's default Burst behavior catches up short delays to the
+            // original schedule instead of accumulating timing drift. After
+            // a long stall, such as a suspended machine, catching up would
+            // flood the receiver with stale silence, so start over instead.
+            if scheduled.elapsed() > MAX_CATCH_UP {
+                warn!(
+                    "rtp: {:?} behind schedule, skipping ahead",
+                    scheduled.elapsed()
+                );
+                ticker.reset();
+            }
             self.send_one().await?;
         }
     }

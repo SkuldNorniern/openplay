@@ -8,10 +8,12 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use log::debug;
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
 
+use super::is_transient;
 use super::timing::NtpTimestamp;
 
 pub const SYNC_PACKET_LEN: usize = 20;
@@ -103,7 +105,15 @@ impl SyncSender {
             self.latency_frames,
             NtpTimestamp::now()?,
         );
-        let sent = self.socket.send_to(&packet, self.receiver_addr).await?;
+        let sent = match self.socket.send_to(&packet, self.receiver_addr).await {
+            Ok(sent) => sent,
+            // Try again before the next audio packet; nothing advances.
+            Err(error) if is_transient(&error) => {
+                debug!("sync: send failed, retrying: {error}");
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if sent != packet.len() {
             return Err(Error::Protocol(format!(
                 "sync: sent {sent} of {} UDP packet bytes",

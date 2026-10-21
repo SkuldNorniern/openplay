@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
 
-use super::bind_udp;
+use super::{bind_udp, is_transient};
 
 pub const TIMING_PACKET_LEN: usize = 32;
 
@@ -39,7 +39,7 @@ const NTP_TIMESTAMP_LEN: usize = 8;
 const NTP_SECONDS_END: usize = 4;
 /// Large enough that an oversized datagram is seen as oversized rather than
 /// silently truncated to a plausible 32 bytes.
-const RECEIVE_BUFFER_LEN: usize = 64;
+const RECEIVE_BUFFER_LEN: usize = 2_048;
 
 /// A 64-bit NTP timestamp: seconds since 1900-01-01 plus a 1/2^32-second fraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,17 +54,18 @@ impl NtpTimestamp {
         Self::from_unix(SystemTime::now())
     }
 
-    /// Convert a Unix wall-clock instant without silently accepting pre-epoch times
-    /// or timestamps whose NTP seconds field cannot fit on the wire.
+    /// Convert a Unix wall-clock instant, rejecting pre-epoch times.
+    ///
+    /// The 32-bit seconds field wraps at the end of each NTP era (first in
+    /// February 2036); receivers resolve the era from context, so it wraps
+    /// here too instead of failing.
     pub fn from_unix(time: SystemTime) -> Result<Self> {
         let since_unix_epoch = time.duration_since(UNIX_EPOCH).map_err(|error| {
             Error::Protocol(format!("timing timestamp precedes the Unix epoch: {error}"))
         })?;
         let seconds = since_unix_epoch
             .as_secs()
-            .checked_add(NTP_UNIX_EPOCH_OFFSET)
-            .and_then(|seconds| u32::try_from(seconds).ok())
-            .ok_or_else(|| Error::Protocol("timing timestamp exceeds the NTP era".to_owned()))?;
+            .wrapping_add(NTP_UNIX_EPOCH_OFFSET) as u32;
         let fraction = ((u64::from(since_unix_epoch.subsec_nanos()) << NTP_FRACTION_BITS)
             / NANOS_PER_SECOND) as u32;
 
@@ -196,7 +197,14 @@ impl TimingResponder {
     /// UDP port cannot tear down the session.
     pub async fn respond_once(&self) -> Result<bool> {
         let mut buffer = [0_u8; RECEIVE_BUFFER_LEN];
-        let (length, peer) = self.socket.recv_from(&mut buffer).await?;
+        let (length, peer) = match self.socket.recv_from(&mut buffer).await {
+            Ok(received) => received,
+            Err(error) if is_transient(&error) => {
+                debug!("timing: receive failed, continuing: {error}");
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
         // Stamp before any parsing so our processing time is not counted as
         // network delay by the receiver.
         let receive_time = NtpTimestamp::now()?;
@@ -213,7 +221,14 @@ impl TimingResponder {
         };
 
         let reply = build_timing_response(request, receive_time, NtpTimestamp::now()?);
-        let sent = self.socket.send_to(&reply, peer).await?;
+        let sent = match self.socket.send_to(&reply, peer).await {
+            Ok(sent) => sent,
+            Err(error) if is_transient(&error) => {
+                debug!("timing: send failed, continuing: {error}");
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if sent != reply.len() {
             return Err(Error::Protocol(format!(
                 "timing: sent {sent} of {} UDP packet bytes",
@@ -308,6 +323,15 @@ mod tests {
 
         assert_eq!(timestamp.to_bytes(), expected);
         assert_eq!(NtpTimestamp::from_bytes(expected), timestamp);
+    }
+
+    #[test]
+    fn seconds_wrap_into_the_next_ntp_era() {
+        // 2036-02-07 06:28:16 UTC is the first second of NTP era 1.
+        let era_one =
+            UNIX_EPOCH + Duration::from_secs(1 << 32) - Duration::from_secs(2_208_988_800);
+        let stamp = NtpTimestamp::from_unix(era_one + Duration::from_secs(5)).expect("convert");
+        assert_eq!(stamp.seconds, 5);
     }
 
     #[test]

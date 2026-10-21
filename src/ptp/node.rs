@@ -12,12 +12,15 @@ use tokio::select;
 use super::follower::{Action, Follower};
 use super::message::{Message, Timestamp};
 use crate::error::Result;
+use crate::rtp::is_transient;
 
 /// Standard PTP event port, where Sync and Delay_Req travel.
 pub const EVENT_PORT: u16 = 319;
 /// Standard PTP general port, for Follow_Up, Delay_Resp and Announce.
 pub const GENERAL_PORT: u16 = 320;
-const RECEIVE_BUFFER_LEN: usize = 512;
+/// Room for any datagram a LAN peer sends, so Windows never fails a
+/// receive as oversized.
+const RECEIVE_BUFFER_LEN: usize = 2_048;
 
 /// Monotonic local time in nanoseconds since the node started. Wall-clock
 /// steps would corrupt the offset, so all local stamps come from here.
@@ -132,15 +135,17 @@ impl PtpNode {
         let mut event_buffer = [0_u8; RECEIVE_BUFFER_LEN];
         let mut general_buffer = [0_u8; RECEIVE_BUFFER_LEN];
         loop {
-            let (length, peer, from_event) = select! {
-                received = self.event.recv_from(&mut event_buffer) => {
-                    let (length, peer) = received?;
-                    (length, peer, true)
+            let (received, from_event) = select! {
+                received = self.event.recv_from(&mut event_buffer) => (received, true),
+                received = self.general.recv_from(&mut general_buffer) => (received, false),
+            };
+            let (length, peer) = match received {
+                Ok(received) => received,
+                Err(error) if is_transient(&error) => {
+                    debug!("ptp: receive failed, continuing: {error}");
+                    continue;
                 }
-                received = self.general.recv_from(&mut general_buffer) => {
-                    let (length, peer) = received?;
-                    (length, peer, false)
-                }
+                Err(error) => return Err(error.into()),
             };
             // Stamp before parsing so decode time is not counted as path delay.
             let received = self.time.local.now();
@@ -163,9 +168,16 @@ impl PtpNode {
             if let Action::SendDelayReq { sequence_id, bytes } =
                 self.follower.on_message(&message, received)
             {
-                self.event.send_to(&bytes, self.leader_event).await?;
-                self.follower
-                    .delay_req_sent(sequence_id, self.time.local.now());
+                match self.event.send_to(&bytes, self.leader_event).await {
+                    Ok(_) => self
+                        .follower
+                        .delay_req_sent(sequence_id, self.time.local.now()),
+                    // The exchange is lost; the next Sync starts another.
+                    Err(error) if is_transient(&error) => {
+                        debug!("ptp: delay request failed: {error}");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             self.time.publish(&self.follower);
         }

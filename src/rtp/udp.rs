@@ -1,10 +1,39 @@
 //! UDP socket binding shared by the audio, control, and timing channels.
 
+use std::io::{Error as IoError, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
+
+/// OS error codes for a datagram larger than the receive buffer and for
+/// momentarily exhausted socket buffers: EMSGSIZE and ENOBUFS on Linux,
+/// WSAEMSGSIZE and WSAENOBUFS on Windows.
+const TRANSIENT_OS_CODES: [i32; 4] = [90, 105, 10_040, 10_055];
+
+/// Whether a UDP socket stays usable after `error`.
+///
+/// Windows reports an ICMP port-unreachable for an earlier send on the
+/// next call, and fails oversized datagrams instead of truncating them;
+/// Wi-Fi drops make sends fail for a moment everywhere. A long-lived
+/// socket loop logs these and carries on: one stray datagram or network
+/// blip must not end a session.
+pub fn is_transient(error: &IoError) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| TRANSIENT_OS_CODES.contains(&code))
+}
 
 /// Bind a UDP socket on an ephemeral port in the receiver's address family.
 ///
@@ -43,6 +72,14 @@ mod tests {
             socket.local_addr().expect("address"),
             SocketAddr::from((Ipv4Addr::LOCALHOST, port))
         );
+    }
+
+    #[test]
+    fn transient_errors_are_recognised() {
+        assert!(is_transient(&IoError::from(ErrorKind::ConnectionReset)));
+        assert!(is_transient(&IoError::from_raw_os_error(10_040)));
+        assert!(!is_transient(&IoError::from(ErrorKind::PermissionDenied)));
+        assert!(!is_transient(&IoError::from(ErrorKind::AddrInUse)));
     }
 
     #[tokio::test]

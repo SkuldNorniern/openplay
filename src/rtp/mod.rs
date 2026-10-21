@@ -16,4 +16,4 @@ pub use sync::SyncSender;
 pub use timing::{
     NtpTimestamp, TimingRequest, TimingResponder, build_timing_response, parse_timing_request,
 };
-pub use udp::bind_udp;
+pub use udp::{bind_udp, is_transient};
