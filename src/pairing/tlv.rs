@@ -120,7 +120,7 @@ impl Tlv {
 mod tests {
     use super::*;
 
-    // Real pair-setup M1 (transient) captured from HomePod mini "Speaker".
+    // Transient pair-setup M1 as a HomePod expects it.
     const M1: &[u8] = &[
         0x00, 0x01, 0x00, // Method = 0
         0x06, 0x01, 0x01, // State = 1

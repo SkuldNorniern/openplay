@@ -76,7 +76,7 @@ pub fn usage() -> &'static str {
      \x20 -v, --verbose     more log detail\n\
      \x20 -h, --help        show this help\n\
      \n\
-     <target> is a receiver name (e.g. Speaker) or an IP address.\n\
+     <target> is a receiver name (e.g. Kitchen) or an IP address.\n\
      A file of - reads interleaved little-endian PCM from stdin."
 }
 

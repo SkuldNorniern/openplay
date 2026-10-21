@@ -193,7 +193,7 @@ mod tests {
 
     use super::*;
 
-    /// Speaker HomePod mini's `features` from its `/info`.
+    /// `features` a HomePod mini advertises.
     const HOMEPOD_FEATURES: u64 = 0x3c35_4bd0_4a7f_ca00;
 
     fn record(txt: &[(&str, &str)]) -> ServiceRecord {

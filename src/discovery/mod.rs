@@ -175,10 +175,7 @@ mod tests {
         let r = &recs[0];
         assert_eq!(r.instance, "Speaker");
         assert_eq!(r.port, 7000);
-        assert_eq!(
-            r.addrs,
-            vec![IpAddr::from(Ipv4Addr::new(192, 0, 2, 20))]
-        );
+        assert_eq!(r.addrs, vec![IpAddr::from(Ipv4Addr::new(192, 0, 2, 20))]);
         assert_eq!(r.txt.get("model").map(String::as_str), Some("J305"));
     }
 

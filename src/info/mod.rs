@@ -156,11 +156,11 @@ async fn read_response(stream: &mut TcpStream) -> Result<Response> {
 mod tests {
     use super::*;
 
-    // Real `GET /info` response body captured from HomePod mini "Speaker".
+    // Synthetic `GET /info` body with the keys and types a HomePod mini sends.
     const INFO: &[u8] = include_bytes!("../../tests/fixtures/info.plist");
 
     #[test]
-    fn parses_real_homepod_info() {
+    fn parses_homepod_info() {
         let info = DeviceInfo::from_plist(INFO).expect("parse");
         assert_eq!(info.name, "Speaker");
         assert_eq!(info.model, "AudioAccessory5,1");
