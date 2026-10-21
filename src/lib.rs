@@ -18,6 +18,7 @@ pub mod pairing;
 pub mod ptp;
 pub mod rtp;
 pub mod rtsp;
+pub mod sender;
 pub mod session;
 
 pub use error::{Error, Result};
