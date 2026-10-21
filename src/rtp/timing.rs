@@ -6,12 +6,14 @@
 //! receive and transmit times, which lets the receiver estimate our clock.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
+
+use super::bind_udp;
 
 pub const TIMING_PACKET_LEN: usize = 32;
 
@@ -174,18 +176,7 @@ impl TimingResponder {
     /// Only datagrams from `receiver_ip` are answered; the receiver picks its
     /// own source port, so the port is not checked.
     pub async fn bind(receiver_ip: IpAddr, bind: Option<Ipv4Addr>) -> Result<(Self, u16)> {
-        let local_addr = match receiver_ip {
-            IpAddr::V4(_) => SocketAddr::from((bind.unwrap_or(Ipv4Addr::UNSPECIFIED), 0)),
-            IpAddr::V6(_) => {
-                if bind.is_some() {
-                    return Err(Error::Protocol("cannot bind IPv4 to an IPv6 target".into()));
-                }
-                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-            }
-        };
-
-        let socket = UdpSocket::bind(local_addr).await?;
-        let local_port = socket.local_addr()?.port();
+        let (socket, local_port) = bind_udp(receiver_ip, bind).await?;
 
         Ok((
             Self {
@@ -244,6 +235,7 @@ impl fmt::Debug for TimingResponder {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::time::Duration;
 
     use tokio::time::timeout;

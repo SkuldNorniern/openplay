@@ -1,7 +1,7 @@
 //! Paced UDP transport for encrypted realtime AirPlay audio.
 
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use rand::random;
@@ -35,36 +35,20 @@ pub struct RtpSender {
 }
 
 impl RtpSender {
-    /// Bind the audio UDP socket to an ephemeral local port and prepare it for
-    /// sending to `receiver_addr`.
+    /// Wrap an audio socket already bound with [`super::bind_udp`].
     ///
-    /// When `bind` is supplied, the socket is bound to that specific local
-    /// IPv4 interface, matching [`crate::info::fetch`]. An IPv4 bind address
-    /// cannot be used with an IPv6 receiver.
-    ///
-    /// The returned port must be included in the session's local stream ports
-    /// during SETUP. The caller is responsible for completing that SETUP
-    /// before starting [`Self::send_one`] or [`Self::run`], so queued real
-    /// audio is not pulled before the receiver is ready.
-    pub async fn bind(
+    /// The socket's port must be included in the session's local stream ports
+    /// during SETUP, and `receiver_addr` is the `dataPort` from the stream
+    /// SETUP response. The caller is responsible for completing SETUP before
+    /// starting [`Self::send_one`] or [`Self::run`], so queued real audio is
+    /// not pulled before the receiver is ready.
+    pub fn new(
+        socket: UdpSocket,
         receiver_addr: SocketAddr,
-        bind: Option<Ipv4Addr>,
         source: AudioSource,
         audio_key: [u8; 32],
-    ) -> Result<(Self, u16)> {
-        let local_addr = match receiver_addr {
-            SocketAddr::V4(_) => SocketAddr::from((bind.unwrap_or(Ipv4Addr::UNSPECIFIED), 0)),
-            SocketAddr::V6(_) => {
-                if bind.is_some() {
-                    return Err(Error::Protocol("cannot bind IPv4 to an IPv6 target".into()));
-                }
-                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-            }
-        };
-
-        let socket = UdpSocket::bind(local_addr).await?;
-        let local_port = socket.local_addr()?.port();
-        let sender = Self {
+    ) -> Self {
+        Self {
             socket,
             receiver_addr,
             source,
@@ -72,9 +56,7 @@ impl RtpSender {
             packet_builder: RtpPacketBuilder::new(random(), audio_key),
             first_packet_sent: false,
             sync: None,
-        };
-
-        Ok((sender, local_port))
+        }
     }
 
     /// Send control-channel sync packets alongside audio, as the receiver
@@ -144,8 +126,11 @@ mod tests {
     use tokio::spawn;
     use tokio::time::{sleep, timeout};
 
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
     use crate::audio::WriteOutcome;
+    use crate::rtp::bind_udp;
 
     const KEY: [u8; 32] = [0x42; 32];
 
@@ -154,10 +139,11 @@ mod tests {
             .await
             .expect("bind peer");
         let receiver_addr = peer.local_addr().expect("peer address");
-        let (sender, local_port) =
-            RtpSender::bind(receiver_addr, Some(Ipv4Addr::LOCALHOST), source, KEY)
+        let (socket, local_port) =
+            bind_udp(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST))
                 .await
-                .expect("bind sender");
+                .expect("bind audio socket");
+        let sender = RtpSender::new(socket, receiver_addr, source, KEY);
         (peer, sender, local_port)
     }
 
@@ -176,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bind_returns_the_bound_ephemeral_port() {
+    async fn new_keeps_the_bound_ephemeral_port() {
         let (_peer, sender, local_port) = peer_and_sender(AudioSource::new(1)).await;
 
         assert_ne!(local_port, 0);
@@ -245,12 +231,14 @@ mod tests {
         let control_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind control peer");
-        let (sync, _) = SyncSender::bind(
+        let (control_socket, _) =
+            bind_udp(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST))
+                .await
+                .expect("bind control socket");
+        let sync = SyncSender::new(
+            control_socket,
             control_peer.local_addr().expect("control address"),
-            Some(Ipv4Addr::LOCALHOST),
-        )
-        .await
-        .expect("bind sync");
+        );
         let mut sender = sender.with_sync(sync);
 
         sender.send_one().await.expect("send packet");

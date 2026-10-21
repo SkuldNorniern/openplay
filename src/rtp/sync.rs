@@ -5,7 +5,7 @@
 //! about every second, each just before the audio packet it describes.
 
 use std::fmt;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
@@ -59,32 +59,19 @@ pub struct SyncSender {
 }
 
 impl SyncSender {
-    /// Bind the control UDP socket to an ephemeral local port.
+    /// Wrap a control socket already bound with [`super::bind_udp`].
     ///
-    /// The returned port is the `controlPort` and `control_port` the sender
-    /// advertises during stream SETUP.
-    pub async fn bind(receiver_addr: SocketAddr, bind: Option<Ipv4Addr>) -> Result<(Self, u16)> {
-        let local_addr = match receiver_addr {
-            SocketAddr::V4(_) => SocketAddr::from((bind.unwrap_or(Ipv4Addr::UNSPECIFIED), 0)),
-            SocketAddr::V6(_) => {
-                if bind.is_some() {
-                    return Err(Error::Protocol("cannot bind IPv4 to an IPv6 target".into()));
-                }
-                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-            }
-        };
-
-        let socket = UdpSocket::bind(local_addr).await?;
-        let local_port = socket.local_addr()?.port();
-        let sender = Self {
+    /// The socket's port is the `controlPort` and `control_port` advertised
+    /// during stream SETUP, and `receiver_addr` is the receiver's
+    /// `controlPort` from the response.
+    pub fn new(socket: UdpSocket, receiver_addr: SocketAddr) -> Self {
+        Self {
             socket,
             receiver_addr,
             sequence: 0,
             first_sent: false,
             packets_until_sync: 0,
-        };
-
-        Ok((sender, local_port))
+        }
     }
 
     /// Call right before each audio packet with that packet's RTP timestamp.
@@ -129,17 +116,20 @@ mod tests {
 
     use tokio::time::timeout;
 
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
+    use crate::rtp::bind_udp;
 
     async fn peer_and_sync() -> (UdpSocket, SyncSender) {
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind peer");
         let receiver_addr = peer.local_addr().expect("peer address");
-        let (sync, _) = SyncSender::bind(receiver_addr, Some(Ipv4Addr::LOCALHOST))
+        let (socket, _) = bind_udp(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST))
             .await
-            .expect("bind sync");
-        (peer, sync)
+            .expect("bind control socket");
+        (peer, SyncSender::new(socket, receiver_addr))
     }
 
     async fn receive_sync(peer: &UdpSocket) -> Vec<u8> {
