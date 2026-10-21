@@ -9,6 +9,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use log::debug;
 use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
@@ -200,10 +201,15 @@ impl TimingResponder {
         // network delay by the receiver.
         let receive_time = NtpTimestamp::now()?;
         if peer.ip() != self.receiver_ip {
+            debug!("timing: ignored datagram from {peer}");
             return Ok(false);
         }
-        let Ok(request) = parse_timing_request(&buffer[..length]) else {
-            return Ok(false);
+        let request = match parse_timing_request(&buffer[..length]) {
+            Ok(request) => request,
+            Err(error) => {
+                debug!("timing: ignored datagram: {error}");
+                return Ok(false);
+            }
         };
 
         let reply = build_timing_response(request, receive_time, NtpTimestamp::now()?);
@@ -215,6 +221,7 @@ impl TimingResponder {
             )));
         }
 
+        debug!("timing: answered request {}", request.sequence);
         Ok(true)
     }
 
