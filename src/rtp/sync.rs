@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 
@@ -49,7 +50,7 @@ pub fn build_sync_packet(
 /// Sends sync packets from the control port advertised in SETUP to the
 /// receiver's control port.
 pub struct SyncSender {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     receiver_addr: SocketAddr,
     sequence: u16,
     /// Flipped only after a successful send, so a failed first sync is
@@ -59,12 +60,13 @@ pub struct SyncSender {
 }
 
 impl SyncSender {
-    /// Wrap a control socket already bound with [`super::bind_udp`].
+    /// Use a control socket already bound with [`super::bind_udp`], shared
+    /// with the resend responder that reads from it.
     ///
     /// The socket's port is the `controlPort` and `control_port` advertised
     /// during stream SETUP, and `receiver_addr` is the receiver's
     /// `controlPort` from the response.
-    pub fn new(socket: UdpSocket, receiver_addr: SocketAddr) -> Self {
+    pub fn new(socket: Arc<UdpSocket>, receiver_addr: SocketAddr) -> Self {
         Self {
             socket,
             receiver_addr,
@@ -129,7 +131,7 @@ mod tests {
         let (socket, _) = bind_udp(IpAddr::V4(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST))
             .await
             .expect("bind control socket");
-        (peer, SyncSender::new(socket, receiver_addr))
+        (peer, SyncSender::new(Arc::new(socket), receiver_addr))
     }
 
     async fn receive_sync(peer: &UdpSocket) -> Vec<u8> {

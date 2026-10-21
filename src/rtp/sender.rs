@@ -11,7 +11,7 @@ use tokio::time::interval;
 use crate::audio::{AlacEncoder, AudioSource, Frame};
 use crate::error::{Error, Result};
 
-use super::{RtpPacketBuilder, SyncSender};
+use super::{PacketHistory, RtpPacketBuilder, SyncSender};
 
 const FRAMES_PER_PACKET: usize = 352;
 const SAMPLE_RATE: f64 = 44_100.0;
@@ -32,6 +32,7 @@ pub struct RtpSender {
     /// receiver at all.
     first_packet_sent: bool,
     sync: Option<SyncSender>,
+    history: Option<PacketHistory>,
 }
 
 impl RtpSender {
@@ -56,6 +57,7 @@ impl RtpSender {
             packet_builder: RtpPacketBuilder::new(random(), audio_key),
             first_packet_sent: false,
             sync: None,
+            history: None,
         }
     }
 
@@ -63,6 +65,12 @@ impl RtpSender {
     /// needs them to place audio on its clock.
     pub fn with_sync(mut self, sync: SyncSender) -> Self {
         self.sync = Some(sync);
+        self
+    }
+
+    /// Keep sent packets so lost ones can be retransmitted.
+    pub fn with_history(mut self, history: PacketHistory) -> Self {
+        self.history = Some(history);
         self
     }
 
@@ -94,6 +102,9 @@ impl RtpSender {
             )));
         }
         self.first_packet_sent = true;
+        if let Some(history) = &self.history {
+            history.push(u16::from_be_bytes([packet[2], packet[3]]), packet);
+        }
 
         Ok(frame_count)
     }
@@ -127,6 +138,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
 
     use super::*;
     use crate::audio::WriteOutcome;
@@ -236,7 +248,7 @@ mod tests {
                 .await
                 .expect("bind control socket");
         let sync = SyncSender::new(
-            control_socket,
+            Arc::new(control_socket),
             control_peer.local_addr().expect("control address"),
         );
         let mut sender = sender.with_sync(sync);
@@ -259,6 +271,18 @@ mod tests {
             .is_err(),
             "only one sync is due in first interval"
         );
+    }
+
+    #[tokio::test]
+    async fn sent_packets_are_kept_for_resend() {
+        let (peer, sender, _) = peer_and_sender(AudioSource::new(1)).await;
+        let history = PacketHistory::new(8);
+        let mut sender = sender.with_history(history.clone());
+
+        sender.send_one().await.expect("send packet");
+        let packet = receive_packet(&peer).await;
+
+        assert_eq!(history.get(0), Some(packet));
     }
 
     #[tokio::test]
