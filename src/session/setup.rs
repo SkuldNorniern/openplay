@@ -24,6 +24,11 @@ impl SessionId {
         Self(format!("{:016X}", random::<u64>()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_hex(hex: &str) -> Self {
+        Self(hex.to_owned())
+    }
+
     /// The RTSP request path for this session, e.g. "/1A2B3C4D5E6F7890".
     pub fn path(&self) -> String {
         format!("/{}", self.0)
@@ -64,6 +69,10 @@ impl AudioStreamSecret {
     /// Key that encrypts the RTP audio payloads.
     pub fn audio_key(&self) -> [u8; 32] {
         self.key
+    }
+
+    pub fn iv(&self) -> [u8; 16] {
+        self.iv
     }
 }
 
@@ -215,7 +224,7 @@ pub fn record_request(session: &SessionId) -> Request {
     Request::new("RECORD", &session.path())
 }
 
-fn encode_plist(dictionary: Dictionary) -> Result<Vec<u8>> {
+pub(crate) fn encode_plist(dictionary: Dictionary) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     Value::Dictionary(dictionary)
         .to_writer_binary(&mut body)

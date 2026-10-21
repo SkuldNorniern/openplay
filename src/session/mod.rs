@@ -1,6 +1,7 @@
 //! Session runtime: pairing and the control transport on one connection,
 //! SETUP and RECORD, and the streaming session that ties them together.
 
+pub mod buffered;
 pub mod client;
 pub mod event_channel;
 pub mod setup;
