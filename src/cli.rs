@@ -3,6 +3,7 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::audio::{PcmFormat, SampleFormat};
 
@@ -36,6 +37,8 @@ pub struct Cli {
     pub buffered: bool,
     /// Layout of raw PCM read from stdin.
     pub pcm: PcmFormat,
+    /// Playout latency to ask the receiver for (experimental).
+    pub latency: Option<Duration>,
     pub verbose: bool,
 }
 
@@ -64,6 +67,7 @@ pub fn usage() -> &'static str {
      \x20 -i, --iface <ip>  bind to this local IPv4 (LAN interface)\n\
      \x20 --volume <0-100>  playback volume, 0 mutes\n\
      \x20 --buffered        buffered stream timed by PTP (experimental)\n\
+     \x20 --latency-ms <n>  playout latency to ask the receiver for (experimental)\n\
      \x20 --rate <hz>       stdin sample rate (default 44100)\n\
      \x20 --channels <n>    stdin channel count (default 2)\n\
      \x20 --sample <type>   stdin sample type: s16, s24, s32 or f32 (default s16)\n\
@@ -82,6 +86,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
     let mut volume = None;
     let mut buffered = false;
     let mut pcm = PcmFormat::AIRPLAY;
+    let mut latency = None;
     let mut verbose = false;
     let mut selected = Selected::default();
     let mut positionals: Vec<String> = Vec::new();
@@ -103,6 +108,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
             "--device" => selected.device = Some(it.next().ok_or(CliError::Usage)?),
             "--buffered" => buffered = true,
             "--rate" => pcm.sample_rate = parse_value(it.next())?,
+            "--latency-ms" => {
+                latency = Some(Duration::from_millis(parse_value(it.next())?));
+            }
             "--channels" => pcm.channels = parse_value(it.next())?,
             "--sample" => {
                 pcm.sample = match it.next().as_deref() {
@@ -142,6 +150,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, CliError> {
         volume,
         buffered,
         pcm,
+        latency,
         verbose,
     })
 }
@@ -317,6 +326,19 @@ mod tests {
                 Err(CliError::Usage)
             ));
         }
+    }
+
+    #[test]
+    fn parses_latency_in_milliseconds() {
+        assert_eq!(
+            parse_ok(&["Speaker", "-", "--latency-ms", "100"]).latency,
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(parse_ok(&["Speaker", "-"]).latency, None);
+        assert!(matches!(
+            parse(["Speaker", "-", "--latency-ms", "-5"].map(String::from)),
+            Err(CliError::Usage)
+        ));
     }
 
     #[test]

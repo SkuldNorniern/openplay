@@ -18,12 +18,16 @@ use tokio::{select, spawn};
 
 use crate::audio::{AudioInput, AudioSource, PcmFormat, SourceStats};
 use crate::error::{Error, Result};
-use crate::session::{self, Identity, Streaming};
+use crate::session::{self, DEFAULT_LATENCY_FRAMES, Identity, StreamOptions, Streaming};
 
-/// Half a second of 44.1 kHz audio: the most the ring buffers.
-pub const DEFAULT_CAPACITY_FRAMES: usize = 22_050;
-/// A quarter second: the fill drift correction aims for with live input.
-pub const DEFAULT_TARGET_FRAMES: usize = 11_025;
+/// 200 ms of 44.1 kHz audio: the most the ring buffers before dropping the
+/// oldest, which bounds added latency when the receiver stalls.
+pub const DEFAULT_CAPACITY_FRAMES: usize = 8_820;
+/// 50 ms: the fill drift correction holds with live input. Packets leave
+/// every 8 ms and audio engines deliver every 10 ms or so, so this leaves
+/// room for scheduling jitter without adding noticeable delay.
+pub const DEFAULT_TARGET_FRAMES: usize = 2_205;
+const SAMPLE_RATE: f64 = 44_100.0;
 const FIRST_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 const COMMAND_QUEUE: usize = 8;
@@ -54,6 +58,9 @@ pub struct SenderConfig {
     /// Who we are to the receiver; a fresh random identity when unset.
     /// Store [`Identity::device_id`] to stay the same device across runs.
     pub identity: Option<Identity>,
+    /// Playout latency to ask a realtime receiver for. Unset keeps what the
+    /// working HomePod capture used; lower values may not be honoured.
+    pub receiver_latency: Option<Duration>,
 }
 
 impl Default for SenderConfig {
@@ -67,6 +74,7 @@ impl Default for SenderConfig {
             target_frames: DEFAULT_TARGET_FRAMES,
             max_retries: None,
             identity: None,
+            receiver_latency: None,
         }
     }
 }
@@ -75,9 +83,11 @@ impl Default for SenderConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Connecting,
-    /// Streaming to the named receiver.
+    /// Streaming to the named receiver, with the estimated time from input
+    /// to sound, for a driver to report so players keep video in sync.
     Streaming {
         receiver: String,
+        latency: Duration,
     },
     /// Waiting to retry after `error`.
     Reconnecting {
@@ -195,17 +205,17 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
 ) {
     // One identity for every reconnect, so the receiver sees one device.
-    let identity = config.identity.unwrap_or_else(Identity::generate);
+    let options = StreamOptions {
+        bind: config.bind,
+        identity: config.identity.unwrap_or_else(Identity::generate),
+        latency_frames: config.receiver_latency.map(duration_frames),
+    };
     let mut attempt = 0_u32;
     loop {
         status.send_replace(Status::Connecting);
         let started = match config.mode {
-            StreamMode::Realtime => {
-                session::start(addr, config.bind, identity, source.clone()).await
-            }
-            StreamMode::Buffered => {
-                session::start_buffered(addr, config.bind, identity, source.clone()).await
-            }
+            StreamMode::Realtime => session::start(addr, options, source.clone()).await,
+            StreamMode::Buffered => session::start_buffered(addr, options, source.clone()).await,
         };
         let ended = match started {
             Ok(streaming) => {
@@ -253,8 +263,13 @@ async fn stream(
     {
         return Ended::Failed(error);
     }
+    let receiver_frames = streaming
+        .receiver_latency_frames()
+        .or(config.receiver_latency.map(duration_frames))
+        .unwrap_or(DEFAULT_LATENCY_FRAMES);
     status.send_replace(Status::Streaming {
         receiver: streaming.device().name.clone(),
+        latency: frames_duration(config.target_frames as u64 + u64::from(receiver_frames)),
     });
 
     loop {
@@ -306,6 +321,14 @@ async fn wait_or_stop(delay: Duration, commands: &mut mpsc::Receiver<Command>) -
     }
 }
 
+fn duration_frames(duration: Duration) -> u32 {
+    (duration.as_secs_f64() * SAMPLE_RATE).round() as u32
+}
+
+fn frames_duration(frames: u64) -> Duration {
+    Duration::from_secs_f64(frames as f64 / SAMPLE_RATE)
+}
+
 /// Doubling backoff from half a second, capped at ten.
 fn retry_delay(attempt: u32) -> Duration {
     FIRST_RETRY_DELAY
@@ -320,6 +343,12 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+
+    #[test]
+    fn frame_and_duration_conversions_agree() {
+        assert_eq!(duration_frames(Duration::from_millis(100)), 4_410);
+        assert_eq!(frames_duration(2_205), Duration::from_millis(50));
+    }
 
     #[test]
     fn retry_delay_doubles_then_caps() {

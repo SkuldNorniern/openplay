@@ -121,16 +121,22 @@ pub struct LocalStreamPorts {
     pub timing: u16,
 }
 
+/// Playout latency the working HomePod session asked for: 250 ms.
+pub const DEFAULT_LATENCY_FRAMES: u32 = 11_025;
+/// Upper bound offered to the receiver: two seconds.
+const MAX_LATENCY_FRAMES: u32 = 88_200;
+
 /// Build the realtime ALAC stream SETUP request.
 ///
 /// A stream packet carries 352 stereo frames. At 44.1 kHz this keeps packet
 /// cadence and the rest of the sender's ALAC packetization in lockstep.
 /// `secret` must be the same value passed to [`session_setup_request`] for
-/// this session.
+/// this session. `latency_frames` is the lowest playout latency offered.
 pub fn stream_setup_request(
     session: &SessionId,
     ports: &LocalStreamPorts,
     secret: &AudioStreamSecret,
+    latency_frames: u32,
 ) -> Result<Request> {
     let mut stream = Dictionary::new();
     stream.insert("type".into(), Value::from(96_i64));
@@ -142,8 +148,11 @@ pub fn stream_setup_request(
     stream.insert("shiv".into(), Value::Data(secret.iv.to_vec()));
     stream.insert("controlPort".into(), Value::from(ports.control));
     stream.insert("timingPort".into(), Value::from(ports.timing));
-    stream.insert("latencyMin".into(), Value::from(11025_i64));
-    stream.insert("latencyMax".into(), Value::from(88200_i64));
+    stream.insert("latencyMin".into(), Value::from(latency_frames));
+    stream.insert(
+        "latencyMax".into(),
+        Value::from(MAX_LATENCY_FRAMES.max(latency_frames)),
+    );
 
     let mut body = Dictionary::new();
     body.insert(
@@ -391,7 +400,7 @@ mod tests {
                 .body,
         );
         let stream_body = decode_dictionary(
-            &stream_setup_request(&session, &ports, &secret)
+            &stream_setup_request(&session, &ports, &secret, DEFAULT_LATENCY_FRAMES)
                 .expect("build stream setup")
                 .body,
         );
@@ -459,7 +468,8 @@ mod tests {
             timing: 5002,
         };
         let secret = AudioStreamSecret::derive(&fixed_session_key());
-        let request = stream_setup_request(&session, &ports, &secret).expect("build request");
+        let request = stream_setup_request(&session, &ports, &secret, DEFAULT_LATENCY_FRAMES)
+            .expect("build request");
         let body = decode_dictionary(&request.body);
         let streams = body
             .get("streams")

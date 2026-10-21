@@ -14,7 +14,7 @@ use openplay::cli::{self, CliError, Command};
 use openplay::device::{self, Device, DeviceKind, Features};
 use openplay::info;
 use openplay::logging;
-use openplay::sender::{Sender, SenderConfig, Status, StreamMode};
+use openplay::sender::{DEFAULT_CAPACITY_FRAMES, Sender, SenderConfig, Status, StreamMode};
 use openplay::session::USER_AGENT;
 use openplay::{Error, Result};
 use tokio::io::{AsyncReadExt, stdin};
@@ -25,9 +25,10 @@ use tokio::{select, spawn};
 
 const BROWSE_WAIT: Duration = Duration::from_secs(3);
 const AIRPLAY_PORT: u16 = 7000;
-/// The file is fed until about a quarter second is queued, well below the
-/// sender's half-second capacity so nothing is dropped.
-const FEED_TARGET_FRAMES: usize = 11_025;
+/// The file is fed until 100 ms is queued, well below the sender's ring
+/// capacity so nothing is dropped.
+const FEED_TARGET_FRAMES: usize = 4_410;
+const _: () = assert!(FEED_TARGET_FRAMES < DEFAULT_CAPACITY_FRAMES);
 /// Chunk the file like an audio engine period.
 const FEED_PERIOD: Duration = Duration::from_millis(10);
 const FEED_POLL: Duration = Duration::from_millis(4);
@@ -60,19 +61,18 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let settings = Settings {
+        bind: cli.bind,
+        volume: cli.volume,
+        buffered: cli.buffered,
+        latency: cli.latency,
+    };
     let result = match cli.command {
         Command::Discover => run_discover(cli.bind).await,
         Command::Info { target } => run_info(&target, cli.bind).await,
         Command::Devices => run_devices(),
         Command::Loopback { target, device } => {
-            run_loopback(
-                &target,
-                device.as_deref(),
-                cli.bind,
-                cli.volume,
-                cli.buffered,
-            )
-            .await
+            run_loopback(&target, device.as_deref(), &settings).await
         }
         Command::Play { target, file } => {
             let feed = if file == Path::new("-") {
@@ -84,7 +84,7 @@ async fn main() -> ExitCode {
                     .map(Feed::File)
             };
             match feed {
-                Ok(feed) => run_play(&target, feed, cli.bind, cli.volume, cli.buffered).await,
+                Ok(feed) => run_play(&target, feed, &settings).await,
                 Err(error) => Err(error),
             }
         }
@@ -158,19 +158,13 @@ enum Feed {
     Stdin(PcmFormat),
 }
 
-async fn run_play(
-    target: &str,
-    feed: Feed,
-    bind: Option<Ipv4Addr>,
-    volume: Option<u8>,
-    buffered: bool,
-) -> Result<()> {
-    let addr = resolve(target, bind).await?;
+async fn run_play(target: &str, feed: Feed, settings: &Settings) -> Result<()> {
+    let addr = resolve(target, settings.bind).await?;
     let (format, live, name) = match &feed {
         Feed::File(audio) => (audio.format, false, "file"),
         Feed::Stdin(format) => (*format, true, "stdin"),
     };
-    let config = sender_config(bind, volume, buffered, live);
+    let config = sender_config(settings, live);
     let (sender, input) = Sender::start(addr, format, config)?;
     let logger = spawn(log_status(sender.status(), name));
 
@@ -237,12 +231,13 @@ async fn drain(sender: &Sender, wait_for_session: bool) {
 /// Settings for a CLI run. Live input follows its source's clock and
 /// outlasts receiver hiccups; a file is fed at the sender's pace and fails
 /// fast instead.
-fn sender_config(
-    bind: Option<Ipv4Addr>,
-    volume: Option<u8>,
-    buffered: bool,
-    live: bool,
-) -> SenderConfig {
+fn sender_config(cli: &Settings, live: bool) -> SenderConfig {
+    let Settings {
+        bind,
+        volume,
+        buffered,
+        latency,
+    } = *cli;
     SenderConfig {
         bind,
         mode: if buffered {
@@ -253,8 +248,18 @@ fn sender_config(
         volume,
         drift_correction: live,
         max_retries: if live { None } else { Some(PLAY_RETRIES) },
+        receiver_latency: latency,
         ..SenderConfig::default()
     }
+}
+
+/// Stream settings shared by every play mode.
+#[derive(Clone, Copy)]
+struct Settings {
+    bind: Option<Ipv4Addr>,
+    volume: Option<u8>,
+    buffered: bool,
+    latency: Option<Duration>,
 }
 
 /// Resolve once the sender gives up, with its last error.
@@ -279,17 +284,11 @@ fn run_devices() -> Result<()> {
 }
 
 /// Stream what the PC plays until ctrl-c.
-async fn run_loopback(
-    target: &str,
-    device: Option<&str>,
-    bind: Option<Ipv4Addr>,
-    volume: Option<u8>,
-    buffered: bool,
-) -> Result<()> {
+async fn run_loopback(target: &str, device: Option<&str>, settings: &Settings) -> Result<()> {
     // Fails fast where capture is unsupported, before any connection.
     capture::render_devices()?;
-    let addr = resolve(target, bind).await?;
-    let config = sender_config(bind, volume, buffered, true);
+    let addr = resolve(target, settings.bind).await?;
+    let config = sender_config(settings, true);
     let (sender, input) = Sender::start(addr, CAPTURE_FORMAT, config)?;
     let capture = match Loopback::start(device, input) {
         Ok(capture) => capture,
@@ -328,8 +327,11 @@ async fn wait_while(condition: impl Fn() -> bool) {
 async fn log_status(mut status: watch::Receiver<Status>, name: &'static str) {
     loop {
         match status.borrow_and_update().clone() {
-            Status::Streaming { receiver } => {
-                println!("streaming {name} to {receiver}, ctrl-c to stop");
+            Status::Streaming { receiver, latency } => {
+                println!(
+                    "streaming {name} to {receiver} (about {} ms behind), ctrl-c to stop",
+                    latency.as_millis()
+                );
             }
             // The sender logs reconnects itself.
             Status::Connecting

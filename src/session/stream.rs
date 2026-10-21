@@ -30,7 +30,7 @@ use crate::rtp::{
     BufferedSender, HISTORY_PACKETS, PacketHistory, ResendResponder, RtpSender, SyncSender,
     TimingResponder, bind_udp,
 };
-use crate::rtsp::Request;
+use crate::rtsp::{Request, Response};
 
 use super::buffered::{
     Anchor, PtpPeer, buffered_stream_setup_request, ptp_session_setup_request, set_peers_request,
@@ -38,9 +38,9 @@ use super::buffered::{
 };
 use super::client::{Identity, RtspClient};
 use super::{
-    AudioStreamSecret, EventChannel, LocalStreamPorts, SessionId, parse_session_setup_response,
-    parse_stream_setup_response, record_request, session_setup_request, stream_setup_request,
-    volume_db, volume_request,
+    AudioStreamSecret, DEFAULT_LATENCY_FRAMES, EventChannel, LocalStreamPorts, SessionId,
+    parse_session_setup_response, parse_stream_setup_response, record_request,
+    session_setup_request, stream_setup_request, volume_db, volume_request,
 };
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
@@ -52,6 +52,27 @@ const PTP_SYNC_POLL: Duration = Duration::from_millis(20);
 const ANCHOR_DELAY: Duration = Duration::from_secs(1);
 /// Audio kept in flight ahead of the playback position.
 const BUFFERED_LEAD: Duration = Duration::from_secs(2);
+
+/// How to reach and present to the receiver.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamOptions {
+    /// Local IPv4 interface to use, when the machine has several.
+    pub bind: Option<Ipv4Addr>,
+    pub identity: Identity,
+    /// Playout latency to ask a realtime receiver for, in 44.1 kHz frames.
+    /// `None` keeps what the working HomePod capture used.
+    pub latency_frames: Option<u32>,
+}
+
+impl StreamOptions {
+    pub fn new(identity: Identity) -> Self {
+        Self {
+            bind: None,
+            identity,
+            latency_frames: None,
+        }
+    }
+}
 
 /// Background work: each task is named so a failure can say which one died.
 type Tasks = JoinSet<(&'static str, Result<()>)>;
@@ -69,6 +90,8 @@ pub struct Streaming {
     client: RtspClient<TcpStream>,
     session: SessionId,
     device: DeviceInfo,
+    /// Playout latency the receiver reported in its RECORD reply.
+    receiver_latency_frames: Option<u32>,
     tasks: Tasks,
     /// Kept across [`Self::run_until`] calls, so frequent returns (each
     /// UI command) cannot starve the keepalive.
@@ -126,16 +149,16 @@ async fn connect(
 /// sending audio pulled from `source`.
 pub async fn start(
     addr: SocketAddr,
-    bind: Option<Ipv4Addr>,
-    identity: Identity,
+    options: StreamOptions,
     source: AudioSource,
 ) -> Result<Streaming> {
+    let bind = options.bind;
     let Connected {
         mut client,
         device,
         secret,
         ..
-    } = connect(addr, bind, identity).await?;
+    } = connect(addr, bind, options.identity).await?;
     let mut tasks = Tasks::new();
 
     // The receiver asks for timing as soon as session SETUP completes, so the
@@ -154,10 +177,9 @@ pub async fn start(
             &mut client,
             &session,
             &secret,
-            event_port,
-            timing_port,
+            (event_port, timing_port),
             addr,
-            bind,
+            options,
             source,
             &mut tasks,
         )
@@ -174,14 +196,15 @@ async fn start_realtime(
     client: &mut RtspClient<TcpStream>,
     session: &SessionId,
     secret: &AudioStreamSecret,
-    event_port: u16,
-    timing_port: u16,
+    (event_port, timing_port): (u16, u16),
     addr: SocketAddr,
-    bind: Option<Ipv4Addr>,
+    options: StreamOptions,
     source: AudioSource,
     tasks: &mut Tasks,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let receiver_ip = addr.ip();
+    let bind = options.bind;
+    let latency_frames = options.latency_frames.unwrap_or(DEFAULT_LATENCY_FRAMES);
     let event_channel = EventChannel::connect(receiver_ip, event_port, bind).await?;
     spawn_task(tasks, "event channel", event_channel.drain());
 
@@ -193,7 +216,12 @@ async fn start_realtime(
         timing: timing_port,
     };
     let response = client
-        .request(stream_setup_request(session, &ports, secret)?)
+        .request(stream_setup_request(
+            session,
+            &ports,
+            secret,
+            latency_frames,
+        )?)
         .await?;
     let stream_ports = parse_stream_setup_response(&response.body)?;
     let receiver_control_port = stream_ports.require_control_port()?;
@@ -204,10 +232,14 @@ async fn start_realtime(
 
     let control_socket = Arc::new(control_socket);
     let history = PacketHistory::new(HISTORY_PACKETS);
-    let sync = SyncSender::new(
+    let mut sync = SyncSender::new(
         Arc::clone(&control_socket),
         SocketAddr::new(receiver_ip, receiver_control_port),
     );
+    // Only an explicit request changes the sync packets from the capture's.
+    if let Some(latency) = options.latency_frames {
+        sync = sync.with_latency(latency);
+    }
     let resender = ResendResponder::new(control_socket, receiver_ip, history.clone());
     let mut sender = RtpSender::new(
         audio_socket,
@@ -218,26 +250,35 @@ async fn start_realtime(
     .with_sync(sync)
     .with_history(history);
 
-    client.request(record_request(session)).await?;
+    let record = client.request(record_request(session)).await?;
     spawn_task(tasks, "audio", async move { sender.run().await });
     spawn_task(tasks, "resend", async move { resender.run().await });
-    Ok(())
+    Ok(audio_latency(&record))
+}
+
+/// The receiver's playout latency from a RECORD reply's `Audio-Latency`.
+fn audio_latency(record: &Response) -> Option<u32> {
+    let latency = record.headers.get("Audio-Latency")?.trim().parse().ok();
+    if let Some(frames) = latency {
+        info!("receiver latency {frames} frames");
+    }
+    latency
 }
 
 /// Connect to the receiver at `addr`, set up a buffered PTP-timed session,
 /// and start sending audio pulled from `source`.
 pub async fn start_buffered(
     addr: SocketAddr,
-    bind: Option<Ipv4Addr>,
-    identity: Identity,
+    options: StreamOptions,
     source: AudioSource,
 ) -> Result<Streaming> {
+    let bind = options.bind;
     let Connected {
         mut client,
         device,
         secret,
         local_ip,
-    } = connect(addr, bind, identity).await?;
+    } = connect(addr, bind, options.identity).await?;
     let mut tasks = Tasks::new();
     let receiver_ip = addr.ip();
 
@@ -315,7 +356,7 @@ async fn start_buffered_stream(
     source: AudioSource,
     time: PtpTime,
     tasks: &mut Tasks,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let receiver_ip = addr.ip();
     let event_channel = EventChannel::connect(receiver_ip, ports.event, bind).await?;
     spawn_task(tasks, "event channel", event_channel.drain());
@@ -345,7 +386,7 @@ async fn start_buffered_stream(
         .await?;
     let data = connect_tcp(SocketAddr::new(receiver_ip, stream_ports.data_port), bind).await?;
     let mut sender = BufferedSender::new(data, source, secret.audio_key());
-    client.request(record_request(session)).await?;
+    let record = client.request(record_request(session)).await?;
 
     let (network_now, timeline_id) = wait_for_ptp(&time).await?;
     let anchor = Anchor {
@@ -361,7 +402,7 @@ async fn start_buffered_stream(
     spawn_task(tasks, "audio", async move {
         sender.run(start, BUFFERED_LEAD).await
     });
-    Ok(())
+    Ok(audio_latency(&record))
 }
 
 /// Bind the PTP sockets on the standard ports when allowed, otherwise on
@@ -441,17 +482,20 @@ async fn finish(
     session: SessionId,
     device: DeviceInfo,
     mut tasks: Tasks,
-    started: Result<()>,
+    started: Result<Option<u32>>,
 ) -> Result<Streaming> {
-    if let Err(error) = started {
-        // Leaving a half-built session behind makes the receiver ignore the
-        // next attempt for a while, so end it before reporting.
-        tasks.abort_all();
-        if let Err(teardown_error) = client.request(teardown_request(&session)).await {
-            warn!("teardown after failed setup: {teardown_error}");
+    let receiver_latency_frames = match started {
+        Ok(latency) => latency,
+        Err(error) => {
+            // Leaving a half-built session behind makes the receiver ignore the
+            // next attempt for a while, so end it before reporting.
+            tasks.abort_all();
+            if let Err(teardown_error) = client.request(teardown_request(&session)).await {
+                warn!("teardown after failed setup: {teardown_error}");
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     let mut feedback = interval(FEEDBACK_INTERVAL);
     feedback.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The first tick is immediate; RECORD has just been answered.
@@ -460,6 +504,7 @@ async fn finish(
         client,
         session,
         device,
+        receiver_latency_frames,
         tasks,
         feedback,
     })
@@ -469,6 +514,12 @@ impl Streaming {
     /// Receiver description from `/info`.
     pub fn device(&self) -> &DeviceInfo {
         &self.device
+    }
+
+    /// Playout latency the receiver reported, in 44.1 kHz frames, when it
+    /// sent one.
+    pub fn receiver_latency_frames(&self) -> Option<u32> {
+        self.receiver_latency_frames
     }
 
     /// Set playback volume, 0 (mute) to 100.
