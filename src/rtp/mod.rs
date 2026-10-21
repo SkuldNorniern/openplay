@@ -1,5 +1,6 @@
 //! RTP packet construction and transport for realtime AirPlay audio.
 
+pub mod buffered;
 pub mod packet;
 pub mod resend;
 pub mod sender;
@@ -7,6 +8,7 @@ pub mod sync;
 pub mod timing;
 pub mod udp;
 
+pub use buffered::{BufferedSender, frame_packet};
 pub use packet::RtpPacketBuilder;
 pub use resend::{HISTORY_PACKETS, PacketHistory, ResendResponder};
 pub use sender::RtpSender;
